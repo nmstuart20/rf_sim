@@ -4,7 +4,7 @@ Nov 6, 2026 · @Nick Stuart
 
 ## Purpose and scope
 
-Build a real-time, deterministic simulator that turns RF scenarios into IQ at simulated receivers, replacing the range's in-house tool. Output streams to software consumers or SDRs, and the same inputs always produce the same samples.
+Build a real-time, deterministic simulator that turns RF scenarios into IQ at simulated receivers. Output streams to software consumers or SDRs, and the same inputs always produce the same samples.
 
 **Goals**
 
