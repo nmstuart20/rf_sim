@@ -26,9 +26,10 @@ Contents:
 | Quantity | Type | Unit / scale | Range | Overflow |
 | --- | --- | --- | --- | --- |
 | Truth time `TruthTime` | i64 | picoseconds from scenario epoch | ±2⁶³ ps ≈ ±106.7 days | checked; error |
-| Sub-ps remainder | see §3.1 | fraction of 1 ps | [0, 1) | n/a |
+| Sub-ps fraction (`AcqInstant.frac`) | u64 | 2⁻⁶⁴ ps, floor of the exact instant (§3.1) | [0, 1) ps | n/a |
+| Exact index-time remainder (`ExactTime.rem`) | u64 over the reduced rate numerator | fraction of 1 ps | [0, 1) ps | n/a |
 | Sample index `SampleIndex` | u64 | samples, per receiver channel, from channel epoch | 2⁶⁴ | checked; error |
-| Sample rate `SampleRate` | (u64 num, u64 den), reduced, nonzero | samples per second = num/den | bounded, §10 | rejected at construction |
+| Sample rate `SampleRate` | (u64 num, u64 den), reduced, nonzero | samples per second = num/den | den ≤ 2³², num ≤ 2⁴⁸, num/den ≤ 10⁹ | rejected at construction |
 | Path delay (output) | i64 Q32.32 | output samples | ±2³¹ samples (2.1 s at 1 GS/s) | range-checked at fit time |
 | Carrier phase (output) | u64 | 2⁻⁶⁴ cycle | one cycle | **wraps by design** |
 | Delay/phase polynomial coefficients | 128-bit, Newton forward differences D0..D3 | output scale + 64 extra fractional bits | n/a | **wraps by design** (§1.3) |
@@ -39,8 +40,14 @@ Wrapping is allowed only for carrier phase and the Newton-form polynomial regist
 ### 1.2 Time and index conversions
 
 - Ideal map: `t(n) = channel_epoch + n · den / num` seconds, evaluated in ps as `n · den · 10¹² / num` with u128 intermediates. The quotient is the integer ps, and the remainder `(n · den · 10¹²) mod num` over `num` is the exact sub-ps fraction.
-- Time → index: floor. Index → time: exact when representable, otherwise floor plus the returned remainder. The remainder is never dropped on the geometry path (prompt 1).
-- Rational bounds must make every intermediate provably fit in u128 for rates ≤ 1 GS/s and runs ≤ 100 days. `n ≤ 8.64·10¹⁵ < 2⁵³` and `10¹² < 2⁴⁰`, so `den ≤ 2³⁴` keeps `n · den · 10¹² < 2¹²⁷`. Proposed limits are in §10. Prompt 1 proves them and enforces them at construction.
+- Time → index: floor (`ChannelTimebase::index_at_or_before`: largest n with exact t(n) ≤ t; a time before the epoch is `BeforeEpoch`). A ceiling companion (`index_at_or_after`) returns the smallest n with t(n) ≥ t, and 0 for times before the epoch.
+- Index → time (`ChannelTimebase::index_to_time`): returns `ExactTime { floor, rem, rem_den = num }`, exact for every index. It is an integer ps time when `rem = 0`. Converting to an `AcqInstant` floors `rem / num` onto the 2⁻⁶⁴ ps grid. The fraction is never dropped on the geometry path.
+- **Rate bounds (settled, prompt 1):** after reduction, `den ≤ 2³²`, `num ≤ 2⁴⁸` and `num/den ≤ 10⁹` (1 GS/s). `SampleRate::from_ratio` rejects anything else, and zero numerators or denominators.
+- **No-overflow proof (prompt 1).** Let `M = den · 10¹² < 2⁷²`.
+  - Index → time: `n · den < 2⁹⁶` always. The product with 10¹² is checked. For runs ≤ 100 days at ≤ 1 GS/s, `n ≤ 8.64·10¹⁵ < 2⁵³`, so it is `< 2¹²⁵` and never overflows. If it does overflow (far larger n), the product is ≥ 2¹²⁸ and the quotient ≥ 2¹²⁸ / 2⁴⁸ = 2⁸⁰, which is not a valid i64 ps time anyway. So the check never rejects a representable result, and the error is `TimeOverflow` either way. The epoch is added in i128 and range-checked into i64.
+  - Time → index: `d = t − epoch` is computed in i128, `|d| < 2⁶⁴`. `d · num < 2¹¹²`. The quotient is ≤ d / 1000 < 2⁵⁴, so it always fits in u64.
+  - Remainder → fraction: `rem < num ≤ 2⁴⁸`, so `rem · 2⁶⁴ < 2¹¹²`.
+  - A property test checks that `index_to_time` fails exactly when the true time does not fit in i64, for arbitrary u64 indices, epochs and accepted rates.
 
 ### 1.3 Block polynomials (delay and phase)
 
@@ -122,10 +129,12 @@ trait ClockMap {
     /// Stable identity (content hash of the model + parameters) for cache keys and manifests.
     fn id(&self) -> ClockMapId;
 }
-AcqInstant = { ps: TruthTime, frac: sub-picosecond fraction }   // representation fixed in prompt 1
+AcqInstant = { ps: TruthTime, frac: u64 }   // ps + frac·2⁻⁶⁴ ps, i.e. signed Q64.64 ps (settled, prompt 1)
 ```
 
-- **Ideal map:** the exact rational map of §1.2. This is the v1 implementation, and the first render code uses the trait, not a shortcut.
+- **Ideal map:** the exact rational map of §1.2, floored onto the 2⁻⁶⁴ ps grid (`IdealClockMap`). This is the v1 implementation, and the first render code uses the trait, not a shortcut. Its identity is SHA-256 of `"iqsim.clockmap.ideal.v1\0" ‖ epoch_ps (i64 LE) ‖ num (u64 LE) ‖ den (u64 LE)`.
+- **AcqInstant representation (settled, prompt 1):** `ps + frac · 2⁻⁶⁴` picoseconds, floor of the exact instant. A fixed binary grid works the same for the ideal and perturbed maps, and it is a plain 128-bit integer for the GPU port. The quantization error is < 2⁻⁶⁴ ps ≈ 5.4·10⁻²⁰ ps. At 12 GHz that is < 5·10⁻²¹ rad of carrier phase, so it uses none of the §10 phase or delay budget. Rounding keeps the map strictly increasing, because samples are ≥ 1000 ps apart.
+- **Inverse:** `index_at_or_after(t)` returns the smallest n with `instant(n) ≥ t`, and `index_at_or_before(t)` the largest n with `instant(n) ≤ t` (`None` before sample 0). Both compare against the floored instants, so `index_at_or_after(instant(n)) = index_at_or_before(instant(n)) = n` exactly. The inverse returns only the index. A caller that needs the sub-sample offset computes `t − instant(n)` exactly in Q64.64. When no representable sample is at or after t, `index_at_or_after` is `TimeOverflow`.
 - **Perturbed maps (prompt 15):** frequency offset, drift, aging, optional GPSDO discipline, and phase noise driven by Philox. They are deterministic and strictly monotone, so the inverse is well defined (integer search over a monotone function). Cumulative random processes are integrated on the control plane in block order and frozen into per-block coefficients. Evaluating a block never depends on partitioning or on which device renders it.
 - **Coherent channels:** the M channels of one receiver share one oscillator. Each channel's index → instant goes through the shared oscillator time at shared physical times, so channels with different rates stay coherent.
 - **Antenna-port tap:** uses the declared output-device timebase, which is the ideal map at the device's nominal rate. It bypasses every virtual clock impairment.
@@ -280,8 +289,9 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 
 | Item | Proposed | Settled by |
 | --- | --- | --- |
-| Carrier phase error (above null floor) | ≤ 0.01 rad | prompt 1–2 |
-| Delay error | ≤ 0.001 samples | prompt 1–2 |
+| Carrier phase error (above null floor) | ≤ 0.01 rad (**settled**). Time representation contributes < 10⁻²⁰ rad, so the full budget goes to fitting and polynomial quantization. | prompt 1; prompt 2 shows the quantization share |
+| Delay error | ≤ 0.001 samples (**settled**). Time representation contributes < 2⁻⁶⁴ ps. | prompt 1; prompt 2 shows the quantization share |
+| Acquisition-instant representation error | < 2⁻⁶⁴ ps, floor (**settled**) | prompt 1 |
 | Amplitude error (above null floor) | ≤ 0.01 dB | prompt 2 |
 | Null floor | V_ref · 10⁻² (−40 dB) | prompt 2, before prompt 5 |
 | Absolute complex-gain error below floor | ≤ 10⁻³ · V_ref | prompt 2 |
@@ -294,8 +304,8 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 
 **Decisions phase 1 must settle** (record the outcome here, then bump to contract version 1):
 
-1. `SampleRate` numerator and denominator bounds (*proposed* den ≤ 2³², num ≤ 2⁴⁸, rate ≤ 1 GS/s), with the u128 no-overflow proof covering every accepted rate (prompt 1).
-2. `AcqInstant` sub-ps representation: exact rational remainder or a fixed 2⁻⁶⁴ ps fraction (floor). Also how the inverse map reports its remainder (prompt 1).
+1. **Settled (prompt 1).** `SampleRate` bounds: den ≤ 2³², num ≤ 2⁴⁸, rate ≤ 1 GS/s, enforced at construction after reduction. The u128 no-overflow proof is in §1.2.
+2. **Settled (prompt 1).** `AcqInstant` is a fixed 2⁻⁶⁴ ps fraction (floor). `ChannelTimebase::index_to_time` also returns the exact rational remainder. The inverse map returns an index only, and the caller gets the offset by exact Q64.64 subtraction (§3.1).
 3. Exact maximum block length and coefficient-quantization error bounds for delay and phase (prompt 2).
 4. sin/cos table size, polynomial order and table-construction routine (prompt 2).
 5. Subnormal policy (preserve vs documented flush) on CPU and CUDA (prompt 2).

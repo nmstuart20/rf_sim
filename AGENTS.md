@@ -83,6 +83,8 @@ cargo xtask deps      # dependency-graph rules only
 cargo run -p iqsim-cli -- --help
 ```
 
+Property tests use proptest. They run 2048 cases per property by default; set `PROPTEST_CASES=<n>` for a longer run and `PROPTEST_RNG_SEED=<n>` to reproduce a run. Seeds are random by default. When a property fails, proptest saves the failing case under a `proptest-regressions/` directory and replays it first on every later run. Commit those files with the fix, and never delete them to make a test pass.
+
 Golden tests call `iqsim_testkit::assert_golden(name, bytes)`, which compares SHA-256 against `tests/golden/<name>.sha256`. Golden hashes change only through `cargo xtask bless`, and only on purpose: explain every blessed change in progress.md.
 
 ## Working rules
