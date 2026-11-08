@@ -1,0 +1,21 @@
+[package]
+name = "iqsim-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sim"
+path = "src/main.rs"
+
+[dependencies]
+iqsim-runtime.workspace = true
+iqsim-control.workspace = true
+iqsim-hil.workspace = true
+iqsim-scenario.workspace = true
+iqsim-contracts.workspace = true
+
+[lints]
+workspace = true

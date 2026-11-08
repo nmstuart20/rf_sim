@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.99"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+iqsim-core = { path = "crates/iqsim-core" }
+iqsim-units = { path = "crates/iqsim-units" }
+iqsim-contracts = { path = "crates/iqsim-contracts" }
+iqsim-scenario = { path = "crates/iqsim-scenario" }
+iqsim-geo = { path = "crates/iqsim-geo" }
+iqsim-antenna = { path = "crates/iqsim-antenna" }
+iqsim-terrain = { path = "crates/iqsim-terrain" }
+iqsim-behavior = { path = "crates/iqsim-behavior" }
+iqsim-waveform = { path = "crates/iqsim-waveform" }
+iqsim-worklist = { path = "crates/iqsim-worklist" }
+iqsim-render = { path = "crates/iqsim-render" }
+iqsim-render-cuda = { path = "crates/iqsim-render-cuda" }
+iqsim-receiver = { path = "crates/iqsim-receiver" }
+iqsim-io = { path = "crates/iqsim-io" }
+iqsim-control = { path = "crates/iqsim-control" }
+iqsim-runtime = { path = "crates/iqsim-runtime" }
+iqsim-hil = { path = "crates/iqsim-hil" }
+iqsim-testkit = { path = "crates/iqsim-testkit" }
+iqsim-cli = { path = "crates/iqsim-cli" }
+xtask = { path = "xtask" }
+sha2 = "0.10.9"
+hex = "0.4.3"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
+float_arithmetic = "allow"
+
+[profile.release]
+overflow-checks = true
+
+[profile.dev]
+overflow-checks = true
