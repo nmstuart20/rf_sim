@@ -61,6 +61,10 @@ mod timebase;
 mod trig;
 pub mod wide;
 
+/// Numeric contract version (`docs/contracts.md`). It is 0 while §10 is still being
+/// settled; it is written into every run manifest, and replay requires it to match.
+pub const NUMERIC_CONTRACT_VERSION: u32 = 0;
+
 pub use amplitude::{AmplitudeError, Headroom, TargetScale};
 pub use block::{Block, BlockSpec, Blocks};
 pub use clock::{

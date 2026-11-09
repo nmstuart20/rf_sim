@@ -129,6 +129,14 @@ impl TargetScale {
         self.lsb_per_volt
     }
 
+    /// The effective full scale `2⁴⁰ / lsb_per_volt`: the voltage that is exactly 2⁴⁰
+    /// accumulator LSB. It differs from the declared V_fs only by the f32 rounding of
+    /// the scale factor (≤ 2⁻²⁴ relative). Conversions that work on the integer
+    /// accumulator (the antenna port's sc16 code 32768, cf32 1.0) are relative to it.
+    pub fn full_scale_effective_volts(&self) -> f64 {
+        (1_u64 << ACC_SCALE_BITS) as f64 / f64::from(self.lsb_per_volt)
+    }
+
     /// One LSB in volts: exactly `1 / lsb_per_volt`.
     pub fn lsb_volts(&self) -> f64 {
         1.0 / f64::from(self.lsb_per_volt)

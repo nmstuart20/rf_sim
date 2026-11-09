@@ -7,3 +7,11 @@
 //! Dependencies: iqsim-core, iqsim-units.
 
 #![forbid(unsafe_code)]
+
+pub mod manifest;
+
+pub use manifest::{
+    AssetKind, AssetMismatch, AssetRecord, AssetRegistry, BackendRecord, BuildIdentity,
+    EventLogRecord, MANIFEST_SCHEMA_VERSION, NondeterministicRecord, OutputRecord, RunManifest,
+    ScenarioRecord, TruthRecord, canonical_json, canonical_sha256, sha256_hex,
+};

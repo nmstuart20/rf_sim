@@ -20,10 +20,17 @@ iqsim-worklist.workspace = true
 iqsim-render.workspace = true
 iqsim-receiver.workspace = true
 iqsim-io.workspace = true
+libm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
 
 [dev-dependencies]
 iqsim-testkit.workspace = true
-libm.workspace = true
 
 [lints]
 workspace = true

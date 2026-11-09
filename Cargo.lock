@@ -175,8 +175,12 @@ dependencies = [
 name = "iqsim-contracts"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "iqsim-core",
  "iqsim-units",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -203,6 +207,7 @@ version = "0.1.0"
 dependencies = [
  "iqsim-core",
  "iqsim-units",
+ "libm",
 ]
 
 [[package]]
@@ -218,8 +223,12 @@ dependencies = [
 name = "iqsim-io"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "iqsim-contracts",
  "iqsim-core",
+ "iqsim-testkit",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -229,6 +238,7 @@ dependencies = [
  "iqsim-contracts",
  "iqsim-core",
  "iqsim-units",
+ "libm",
 ]
 
 [[package]]
@@ -253,6 +263,7 @@ dependencies = [
 name = "iqsim-runtime"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "iqsim-antenna",
  "iqsim-behavior",
  "iqsim-contracts",
@@ -268,6 +279,9 @@ dependencies = [
  "iqsim-waveform",
  "iqsim-worklist",
  "libm",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

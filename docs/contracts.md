@@ -116,6 +116,7 @@ Floating point is allowed only where its rounding is fixed by construction.
   | --- | --- | --- | --- | --- |
   | 1 | `ReceiverThermalNoise` | channel index | receiver | 0 (`NOISE_SUB_INDEX`) |
 
+- **Entity ids (prompt 6).** A receiver's entity id is the first four bytes, little-endian, of SHA-256(`"iqsim.entity.v1\0"` ‖ name). It does not depend on file order, so reordering a scenario keeps every noise stream. Two receivers whose ids collide are rejected at resolution. Other entity kinds get ids the same way when they first draw random numbers.
 - **Gaussian noise (settled, prompt 3).** `noise(seed, entity, stream, n) -> (f32, f32)` (or `NoiseStream::sample`) is circularly symmetric complex Gaussian with **unit complex power**: `E[I²] = E[Q²] = ½`, `E[I·Q] = 0`, `E|z|² = 1`. Scale it by the RMS voltage of the wanted noise power (§2). Sample n uses one block at counter (n, 0):
   1. `x = w1·2³² + w0`. The radius uniform `u` is `x·2⁻⁶⁴` truncated to 24 significant bits, built as f32 from the bit pattern (leading-zero count, shift, exponent field). `x = 0` gives `u = 2⁻⁶⁵`. So `u ∈ [2⁻⁶⁵, 1 − 2⁻²⁴]`.
   2. `r = sqrt(−ln u)` (IEEE sqrt). `r ≤ sqrt(65·ln 2) ≈ 6.71`, about 9.5 σ per component.
@@ -177,7 +178,10 @@ Contribution component value = `round_ties_even(component_volts / q)` as i64 (`f
 
 **Reduction and finalization.** Emitter partitions return raw i64 I/Q sums. The host, or one designated device, reduces them exactly. Receiver effects and output conversion run once on the complete sum (§5).
 
-**Output conversion.** sc16 or cf32 per sink. i64 → sc16 is `round_ties_even` of the scaled value with clip detection. Clipping is a reported receiver effect on the virtual ADC. On the antenna port, clipping is an error.
+**Output conversion (settled, prompt 6).** sc16 or cf32 per sink.
+
+- **Antenna port** (`iqsim_receiver::PortConverter`), integers only: sc16 `code = round_ties_even(acc / 2²⁵)`, so code 32768 is 2⁴⁰ LSB, the **effective full scale** `2⁴⁰ / lsb_per_volt` (`TargetScale::full_scale_effective_volts`, within 2⁻²⁴ relative of the declared V_fs, and reported in the truth record). A code outside [−32768, 32767] is an error (`PortError::Clip`): clipping would corrupt the hardware drive. cf32 is `f32(acc)·2⁻⁴⁰` (volts / effective full scale), whose only rounding is the i64 → f32 conversion.
+- **Virtual receiver:** the ADC stage of the chain (§5.4). Clipping there is a reported receiver effect, counted per stream in the manifest (`adc_clipped_components`).
 
 **Amplitude tolerance and null floor (settled, prompt 2, with the user).** Each link has a reference voltage `V_ref`, its nominal main-beam amplitude. For a block, `V_ref` is the amplitude the link's direct path would have at the block-start range, at the target's reference plane, with:
 
@@ -331,11 +335,34 @@ The renderer multiplies G by the path's carrier rotation, which equals filtering
 - **Key:** `EdgeTableKey = (TapResponseId, EdgeShape, offset µHz)`. The output rate and tap are part of the response id.
 - **Cache preparation:** tables are immutable. A runtime frequency or response change creates a new key, whose table is built while the work list for the change's effective block is constructed, before that block can render. Blocks already built keep their tables. Eviction is the runtime's job (phase 5).
 
+### 5.4 Virtual-receiver chain (settled, prompt 6)
+
+`iqsim_receiver::chain`. It runs once per channel on the complete reduced i64 sum of the channel's virtual-receiver target. H_rx is already applied to every path before sampling, so the chain never filters the signal by H_rx again. Each stage is switched on by an `Option` in `ChainConfig`. Every stage is f32 with each operation separate and in source order; constants come from f64 + libm on the control plane, rounded once to f32.
+
+| # | Stage | Definition |
+| --- | --- | --- |
+| 0 | volts | `x = f32(acc) / lsb_per_volt` at the receiver input |
+| 1 | front end | `x ·= g`, `g = 10^(G/20)`. The noise figure F feeds stage 2. Off: G = 0 dB, F = 0 dB |
+| 2 | thermal noise | `x += Σ_m t_m·w[n + m]`, w = unit-power Philox noise of `ReceiverThermalNoise(channel)` at the channel sample index. `t_m = σ_w·T·h(τ_g + (m − c)T)`, m = 0..L, `L = 2⌈T_h/T⌉ + 1`, c = (L − 1)/2, `σ_w = √(N₀·F_s·R₀)`, `N₀ = k·T₀·F·g²` (k = 1.380649·10⁻²³ J/K, T₀ = 290 K). Output power is N₀·B_n with B_n = ∫\|H_rx\|² df |
+| 3 | LO offset | `x ·= e^{−j2π·Δf·t_acq(n)}`: `sincos(−phase_at(Δf, ClockMap.instant(n)))`, exact modular phase (§1.6). Phase noise: stub (`PhaseNoise::None`) |
+| 4 | IQ, DC | `I' = I + dc_i`, `Q' = a·(Q·cos φ − I·sin φ) + dc_q`, a = 10^(ε/20), \|φ\| < 45° |
+| 5 | decimation | FIR from the §5.1 family at the input rate (τ_g = 0, f_s ≤ output Nyquist), sampled as in stage 2 with unit scale. Output j = Σ_m t_m·x[jM − m] (causal, zero history at start), so it adds (L − 1)/2 input samples of delay. Output rate F_s/M |
+| 6 | AGC | per output sample: `y = g·x`, `p += α(\|y\|² − p)`, `g += β·g·(T² − p)/T²`, clamp. Starts at g = 1, p = T². Off by default |
+| 7 | ADC | `code = clamp(round_ties_even(x·2^(b−1)/V_adc))`, 2 ≤ b ≤ 16, left-justified (`code << (16 − b)`) in sc16; clips counted. cf32 output is code/32768, or with the ADC off the unquantized `x / V_adc` |
+
+- **Full scales.** V_adc is the per-component clip voltage: a CW tone of power V_adc²/R₀ just reaches it (scenario `adc.full_scale`, a power). The virtual target's accumulator full scale is V_adc/g, so accumulator and ADC share headroom.
+- **State ownership and handoff.** One `ReceiverChannelState` per channel owns the decimation history (L − 1 inputs) and phase, and the AGC gain and power. `process(block, first, acc, clock)` requires block b+1 after block b and contiguous sample indices, and rejects anything else (`OutOfOrder`, `Gap`) without changing state; it never resets. Noise carries no state: it is a correlation over counter-indexed white noise, so each block draws its own L − 1 sample lookahead from the counter. The LO phase comes from each sample's acquisition instant. The output is therefore identical for any block split (tested with splits down to 1 sample and with every stage on).
+- **Determinism note for the CUDA port.** The chain runs on the host after the global reduction in v1. A device port must keep the f32 operation order above, including the noise and FIR sums in increasing m.
+
+### 5.5 Antenna-port output (settled, prompt 6)
+
+The antenna-port target renders through B_out with its own V_fs (scenario `full_scale`, a power: code 32768 ↔ a CW tone of that power) and the ideal output-device timebase (epoch 0, nominal rate). Its accumulator goes straight to `PortConverter` (§2): no gain, noise, LO, IQ, decimation, AGC or ADC, and no state. A test changes H_rx, gain, NF, noise, seed, clock, LO, ADC, IQ, decimation and AGC one at a time: the antenna-port hash never changes, and the virtual-receiver hash always does.
+
 ## 6. Run manifest and replay
 
 A versioned document written alongside every run. It is never part of consumer-visible output.
 
-**Fields (initial).**
+**Fields.** The initial list is below; what prompt 6 implements is under *Implemented*.
 
 - `manifest_schema_version`, `numeric_contract_version`.
 - **build:** package version, git commit and dirty flag, rustc version, target triple, profile, enabled features, `Cargo.lock` SHA-256, CUDA toolkit version and fatbin SHA-256s when the GPU is used.
@@ -347,7 +374,17 @@ A versioned document written alongside every run. It is never part of consumer-v
 - **outputs:** per stream: stream id, tap, sample format, first and last sample index, sample count, SHA-256 of the sample bytes, finalization status. Also the canonical truth-record SHA-256.
 - **nondeterministic section** (excluded from every deterministic hash): wall-clock start and end, host, telemetry summary, performance counters, container-file metadata.
 
-**Replay rules.** `sim replay <manifest>` verifies the build, numeric contract version, resolved scenario, event log and every asset hash before rendering anything. Missing or changed content is rejected. Different builds are not replay. They are compared against stored golden outputs with stated tolerances. Hash algorithm everywhere: SHA-256.
+**Implemented (settled, prompt 6).** `iqsim_contracts::RunManifest`, schema version 1, unknown fields rejected:
+
+- `numeric_contract_version` (`iqsim_core::NUMERIC_CONTRACT_VERSION`, still 0).
+- `build`: package version, rustc release (from `rustc -vV` in `iqsim-runtime/build.rs`), target triple, profile, features (none yet), the SHA-256 of the workspace `Cargo.lock` compiled into the binary, and a **source fingerprint** (SHA-256 over the root `Cargo.toml`, `rust-toolchain.toml`, every crate's `Cargo.toml`, `build.rs` and `src/` files, by sorted relative path, with lengths). Any source edit, committed or not, is a different build. No git commit is recorded: the fingerprint covers what it would, without git at build time. Replay requires every field to match.
+- `scenario`: absolute source path and file SHA-256, the resolved scenario (every default filled in, `iqsim_runtime::ResolvedScenario`) and its canonical SHA-256.
+- `seed`, `run_mode`, `block_ps`, `duration_ps`, `assets` (`AssetRegistry`: kind, logical name, path, length, SHA-256, format, metadata SHA-256; empty until a prompt adds an external input), `event_log` (always absent until prompt 16), `outputs` (stream, sink, tap, format, output rate, centre, first index, count, SHA-256 of the sample bytes, path, finalized, ADC clip count) and `truth` (path and SHA-256 of the canonical truth record). The truth record (schema 1) has per stream the render and output rates and counts, the output → render index factor, the decimation delay in render samples, the first sample's acquisition instant (ClockMap) and reported label (timestamp clock), and the effective full scale; and per (stream, emitter) link the range, delay (s and render samples), carrier offset, response gain and power at the target plane.
+- `backend` (name, threads) and `nondeterministic` (wall-clock start/end, host, render seconds) are excluded from `deterministic_sha256`.
+- **Canonical JSON (decided, prompt 6):** "iqsim canonical JSON v1": no whitespace, object keys sorted by UTF-8 bytes, serde_json string escaping, decimal integers and serde_json's shortest round-trip floats (`float_roundtrip` is enabled so parsing gives the same bits back). It is RFC 8785 except for float formatting outside 10⁻⁶..10²¹; exact quantities are integers, so they never reach that difference.
+- **Run directory:** `consumer/<sink>/<stream>.sigmf-{data,meta}` for consumers; `run/manifest.json` and `run/truth.json` are privileged and never under `consumer/`.
+
+**Replay rules.** `sim replay <manifest>` verifies the build, numeric contract version, resolved scenario, event log and every asset hash before rendering anything. Missing or changed content is rejected. Prompt 6 checks, in this order and before rendering: manifest schema, numeric contract version, build identity, no event log, scenario file hash, the recorded resolved scenario against its own hash, every asset, and the scenario re-resolved by this build against the recorded hash (plus seed, block and duration). It then re-renders into hashing sinks and requires every output record and the truth hash to match. Different builds are not replay. They are compared against stored golden outputs with stated tolerances. Hash algorithm everywhere: SHA-256.
 
 ## 7. Transport choice, framing and delivery guarantees
 
@@ -387,7 +424,7 @@ This is a design choice to validate with the real consumer and target host, not 
 
 **VITA-49 over UDP.** The interoperability profile is pinned when implemented (phase 5): VITA 49.2 signal data packets with stream id, 4-bit packet count, integer and fractional timestamps (units pinned with the profile, *proposed* UTC seconds + picoseconds), and payload sample count. Context packets carry RF reference frequency, sample rate, gain and bandwidth at a pinned cadence and on every change. MTU is pinned (*proposed* 1500 bytes, jumbo optional). UDP send success proves nothing about delivery. The supplied receiver checks continuity from packet count, timestamp and payload count together, handling count wrap. It reports loss, reordering and duplicates, and fails strict consumption on any gap.
 
-**SigMF.** Sequential writes with every error checked. The sample count and SHA-256 are finalized at close. Truth annotations go to a separate sidecar file, never into the consumer's `.sigmf-meta`. In real time, recording shares the sink deadline and resource budget. Offline recording is unpaced.
+**SigMF.** `iqsim_io::sigmf` (prompt 6). Data goes to `<stem>.sigmf-data` (never overwritten), and `<stem>.sigmf-meta` is written only by a successful `finish`, after flush, `sync_all` and a check that the file length equals count × sample size. The meta holds only `core:datatype`, `core:sample_rate`, `core:version` (1.2.0), `core:num_channels`, `core:recorder`, `core:description` and per capture `core:sample_start`, `core:frequency` and `core:datetime`; the API has no extension fields. `core:datetime` is the timestamp clock's label of the first sample's acquisition instant (§3.2; ideal until prompt 15), as UTC with 12 fractional digits, floored to the picosecond. Sequential writes with every error checked. The sample count and SHA-256 are finalized at close. Truth annotations go to a separate sidecar file, never into the consumer's `.sigmf-meta`. In real time, recording shares the sink deadline and resource budget. Offline recording is unpaced.
 
 **Failure classes** (kept distinct in status, logs and exit codes):
 
@@ -423,7 +460,8 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 
 - **iqsim-core:** TruthTime, SampleIndex, SampleRate, `ClockMap` trait and ideal map, commit-boundary time types, fixed point, sin/cos, Philox, the amplitude scale and headroom proof (§2), tap responses and their identities (§5.1), `NUMERIC_CONTRACT_VERSION`. `libm` is a normal dependency since prompt 5, for the control-plane response math only.
 - **iqsim-worklist:** the `#[repr(C)]` work-list and edge-table arena types (§5.2). **iqsim-waveform:** the edge-table builder (§5.3). **iqsim-render:** the `Backend` trait and the CPU kernel.
-- **iqsim-contracts:** pure data and pure encode/decode, with no sockets, files or simulation logic. It holds:
+- **iqsim-receiver:** the virtual-receiver chain and the antenna-port conversion (§5.4, §5.5). **iqsim-io:** SigMF and UTC labels (sha2, serde_json). **iqsim-runtime:** scenario resolution, the offline pipeline, truth record, manifest and replay (sha2, serde, serde_json, hex, libm; a `build.rs` that only runs `rustc -vV`).
+- **iqsim-contracts:** pure data and pure encode/decode, with no sockets, files or simulation logic (serde, serde_json, sha2, hex since prompt 6). It holds:
   - the control envelope, commands, acks and status
   - the handler traits (`CommandHandler`, `StatusProvider`)
   - telemetry records
@@ -448,10 +486,10 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 | Null floor | V_ref · 10⁻² (−40 dB) (**settled**; V_ref defined in §2) | prompt 2 |
 | Absolute complex-gain error below floor | ≤ 10⁻⁵ · V_ref (**settled**; continuous with the relative bound at the floor) | prompt 2 |
 | sincos max abs error | ≤ 3·10⁻⁷ (**settled**; measured 5.98·10⁻⁸) | prompt 2 |
-| Power check | ±0.1 dB vs closed-form link budget | phase 2 |
-| Noise floor check | ±0.2 dB vs kTBF·NF | phase 2 |
+| Power check | ±0.1 dB vs closed-form link budget (**tested**, prompt 6: worst 0.0004 dB over six tones and both taps) | phase 2 |
+| Noise floor check | ±0.2 dB vs kTBF·NF (**tested**, prompt 6: total −0.037 dB, Welch passband −0.036 dB) | phase 2 |
 | Diffraction check | ±0.1 dB vs independent P.526 | phase 8 |
-| Out-of-band in-band level | ±0.1 dB vs selected H_rx/B_out | phase 2 |
+| Out-of-band in-band level | ±0.1 dB vs selected H_rx/B_out (**tested**, prompt 6) | phase 2 |
 | Determinism | identical hashes (CPU, GPU models, split/unsplit) | always |
 
 **Decisions phase 1 must settle** (record the outcome here, then bump to contract version 1):
@@ -513,6 +551,8 @@ Scenario files are TOML, read by `iqsim-scenario` into types from `iqsim-units`.
 - **Epoch:** a TOML offset date-time (or the same text as a string) in UTC (`Z` or `+00:00`), with fractional seconds to 1 ns. It is stored as POSIX seconds plus nanoseconds. A leap second (`:60`) is rejected.
 - **Seed:** a TOML integer from 0 to 2⁶³−1.
 - **Names:** entity names (platforms, emitters, receivers, antenna ports, sinks, resources) share one namespace and match `[A-Za-z0-9][A-Za-z0-9_-]*`. Mount names are unique within their platform, and channel names within their receiver. Library references (antennas, behaviors, waveforms) may also contain `.` and `/`. They are not resolved yet.
-- **Lint checks:** references name an entity of the right kind, and a mount reference names a mount on the referenced platform. Emitter and centre frequencies are positive. Each channel's H_rx bandwidth and each antenna port's B_out bandwidth is positive and at most its complex sample rate, compared exactly as µHz·den ≤ 10⁶·num. A receiver has at least one channel.
+- **Lint checks:** references name an entity of the right kind, and a mount reference names a mount on the referenced platform. Emitter and centre frequencies are positive. Each channel's H_rx and each antenna port's B_out has 0 < bandwidth < stopband ≤ complex sample rate, compared exactly as µHz·den against 10⁶·num; the stopband defaults to the sample rate, so a bandwidth equal to the rate is an error (prompt 6; prompt 4 allowed it). Attenuation is 20–200 dB and group delay 0–1 ms. A `fixed_offset` clock or LO has an `offset` and an `ideal` one has none. Render duration and block are positive. A receiver has at least one channel.
+- **Render and receiver fields (prompt 6).** `[render] duration, block` (default 1 ms; a whole number of samples at every rate, at most `MAX_BLOCK_LEN`). Per channel and antenna port: `response = { stopband, attenuation, group_delay }` (passband edge = bandwidth/2, stopband edge = stopband/2, floored to µHz; defaults rate, 80 dB, 0). Per channel: `front_end = { gain, noise_figure }`, `thermal_noise` (default true), `clock = { model = "fixed_offset", offset }` (an ideal map with a later epoch), `lo = { model = "fixed_offset", offset }`, `iq = { gain_imbalance, phase_skew, dc_i, dc_q }` (DC as a fraction of full scale), `decimation = { factor, bandwidth, stopband, attenuation }` (defaults 0.8 and 1.0 × output rate, 80 dB), `agc = { target, attack, step, min_gain, max_gain }` (defaults −12 dB FS, 0.01, 0.01, ±40 dB) and `adc = { full_scale, bits, enabled }` (defaults 0 dBm, 16, true). Per antenna port: `full_scale` (default 0 dBm). Per sink: `format = "ci16_le" | "cf32_le"`.
+- **What `sim run` supports (prompt 6).** Static platforms; MSL and AGL heights are taken as ellipsoidal (no geoid or terrain yet) and flight levels are rejected; mounts and antennas are ignored (isotropic at the platform origin); emitters must use the built-in `waveform = "cw"` and `behavior = "always_on"`; only SigMF sinks are written, and a stream's sinks must agree on the format. Anything else is a resolution error, never a silent default.
 - **Diagnostics:** `file:line:col: error: message` with 1-based lines and columns counted in characters, then the source line with a caret under the span. Duplicates add a `note:` at the first definition. `sim lint` exits 0 when clean, 1 on errors or an unreadable file, and 2 on usage errors.
 - Clock and LO models (`{ model = "ideal" }`), trajectories (`{ kind = "static" }`), mounts, sinks and resources are placeholders that later prompts extend. Resource capacity is optional, and a missing capacity is reported as unverified (§8).

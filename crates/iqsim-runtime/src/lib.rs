@@ -8,4 +8,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod offline;
+pub mod plan;
 pub mod static_scene;
+
+pub use offline::{
+    LoadedScenario, ReplayReport, RunError, RunOptions, build_identity, load_scenario, replay,
+    run_offline, truth_record,
+};
+pub use plan::{ResolveError, ResolvedScenario, RunPlan, StreamPlan, resolve};

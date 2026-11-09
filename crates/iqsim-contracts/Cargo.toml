@@ -9,6 +9,10 @@ publish.workspace = true
 [dependencies]
 iqsim-core.workspace = true
 iqsim-units.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [lints]
 workspace = true

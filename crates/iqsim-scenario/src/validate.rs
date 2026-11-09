@@ -6,8 +6,11 @@
 //!   channel names within a receiver.
 //! - Every reference names an entity of the right type, and a mount reference
 //!   names a mount on the referenced platform.
-//! - Frequencies that must be positive are, and each channel or antenna-port
-//!   bandwidth is at most its complex sample rate.
+//! - Frequencies that must be positive are. Each channel or antenna-port response has
+//!   0 < bandwidth < stopband ≤ complex sample rate (the stopband defaults to the
+//!   rate), attenuation 20 to 200 dB and group delay 0 to 1 ms.
+//! - Clock and LO `fixed_offset` models have an `offset`, and `ideal` ones do not.
+//! - Render duration and block length are positive.
 //! - A receiver has at least one channel.
 //!
 //! Library references (antennas, waveforms, behaviors) are not resolved yet.
@@ -20,7 +23,10 @@ use toml::Spanned;
 
 use crate::diagnostic::Diagnostic;
 use crate::ident::Ident;
-use crate::model::{SCENARIO_SCHEMA_VERSION, Scenario};
+use crate::model::{
+    ClockModel, ClockModelSpec, LoModel, LoModelSpec, ResponseDetail, SCENARIO_SCHEMA_VERSION,
+    Scenario,
+};
 
 /// Every problem found, in source order.
 pub fn validate(scenario: &Scenario) -> Vec<Diagnostic> {
@@ -113,27 +119,109 @@ impl Validator {
         }
     }
 
-    /// Bandwidth must be positive and at most the complex sample rate.
-    fn bandwidth(
+    /// 0 < bandwidth < stopband ≤ complex sample rate, compared exactly
+    /// (`width_µHz · den` against `10⁶ · num`), plus the attenuation and delay ranges.
+    fn response(
         &mut self,
         bandwidth: &Spanned<Frequency>,
         rate: &Spanned<SampleRate>,
+        detail: &ResponseDetail,
         owner: &str,
     ) {
         self.positive(bandwidth, "the bandwidth");
         let rate = rate.get_ref().get();
-        // bandwidth_µHz ≤ 10⁶ · num/den  ⇔  bandwidth_µHz · den ≤ 10⁶ · num (exact).
-        let lhs = i128::from(bandwidth.get_ref().as_micro_hz()) * i128::from(rate.den());
-        let rhs = 1_000_000 * i128::from(rate.num());
-        if lhs > rhs {
+        let scaled = |f: Frequency| i128::from(f.as_micro_hz()) * i128::from(rate.den());
+        let rate_uhz = 1_000_000 * i128::from(rate.num());
+        let shown = iqsim_units::SampleRate::new(rate);
+        if scaled(*bandwidth.get_ref()) > rate_uhz {
             self.error(
                 bandwidth.span(),
                 format!(
-                    "{owner}: bandwidth {} exceeds the complex sample rate {}",
-                    bandwidth.get_ref(),
-                    iqsim_units::SampleRate::new(rate)
+                    "{owner}: bandwidth {} exceeds the complex sample rate {shown}",
+                    bandwidth.get_ref()
                 ),
             );
+            return;
+        }
+        match &detail.stopband {
+            Some(stop) => {
+                if scaled(*stop.get_ref()) > rate_uhz {
+                    self.error(
+                        stop.span(),
+                        format!(
+                            "{owner}: stopband {} exceeds the complex sample rate {shown}",
+                            stop.get_ref()
+                        ),
+                    );
+                } else if stop.get_ref() <= bandwidth.get_ref() {
+                    self.error(
+                        stop.span(),
+                        format!(
+                            "{owner}: stopband {} must be wider than the bandwidth {}",
+                            stop.get_ref(),
+                            bandwidth.get_ref()
+                        ),
+                    );
+                }
+            }
+            None => {
+                if scaled(*bandwidth.get_ref()) == rate_uhz {
+                    self.error(
+                        bandwidth.span(),
+                        format!(
+                            "{owner}: bandwidth {} leaves no transition band below the \
+                             default stopband (the sample rate {shown}); narrow it or set \
+                             response.stopband",
+                            bandwidth.get_ref()
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(a) = &detail.attenuation
+            && !(20.0..=200.0).contains(&a.get_ref().db())
+        {
+            self.error(
+                a.span(),
+                format!("{owner}: stopband attenuation must be 20 to 200 dB"),
+            );
+        }
+        if let Some(d) = &detail.group_delay {
+            let ps = d.get_ref().get().as_ps();
+            if !(0..=1_000_000_000).contains(&ps) {
+                self.error(d.span(), format!("{owner}: group delay must be 0 to 1 ms"));
+            }
+        }
+    }
+
+    fn clock_and_lo(
+        &mut self,
+        clock: &ClockModelSpec,
+        lo: &LoModelSpec,
+        at: Range<usize>,
+        owner: &str,
+    ) {
+        match (clock.model, &clock.offset) {
+            (ClockModel::Ideal, Some(o)) => self.error(
+                o.span(),
+                format!("{owner}: an ideal clock has no offset; use model = \"fixed_offset\""),
+            ),
+            (ClockModel::FixedOffset, None) => self.error(
+                at.clone(),
+                format!("{owner}: clock model \"fixed_offset\" needs an offset"),
+            ),
+            _ => {}
+        }
+        match (lo.model, &lo.offset) {
+            (LoModel::Ideal, Some(o)) => self.error(
+                o.span(),
+                format!("{owner}: an ideal LO has no offset; use model = \"fixed_offset\""),
+            ),
+            (LoModel::FixedOffset, None) => self.error(
+                at,
+                format!("{owner}: LO model \"fixed_offset\" needs an offset"),
+            ),
+            _ => {}
         }
     }
 
@@ -152,6 +240,20 @@ impl Validator {
                 s.metadata.name.span(),
                 "metadata.name cannot be empty".to_owned(),
             );
+        }
+
+        if let Some(render) = &s.render {
+            if render.duration.get_ref().get().as_ps() <= 0 {
+                self.error(
+                    render.duration.span(),
+                    "render.duration must be positive".to_owned(),
+                );
+            }
+            if let Some(block) = &render.block
+                && block.get_ref().get().as_ps() <= 0
+            {
+                self.error(block.span(), "render.block must be positive".to_owned());
+            }
         }
 
         let mut names = Names::default();
@@ -221,7 +323,8 @@ impl Validator {
                 channels.declare(self, &c.name, "channel", &scope);
                 let owner = format!("channel \"{}\" of {user}", c.name.as_str());
                 self.positive(&c.center_frequency, "the centre frequency");
-                self.bandwidth(&c.bandwidth, &c.sample_rate, &owner);
+                self.response(&c.bandwidth, &c.sample_rate, &c.response, &owner);
+                self.clock_and_lo(&c.clock, &c.lo, c.name.span(), &owner);
                 for sink in &c.sinks {
                     self.reference(&names, sink, "sink", &owner);
                 }
@@ -231,7 +334,7 @@ impl Validator {
             let user = format!("antenna port \"{}\"", a.name.as_str());
             attachment(self, &a.platform, a.mount.as_ref(), &user);
             self.positive(&a.center_frequency, "the centre frequency");
-            self.bandwidth(&a.bandwidth, &a.sample_rate, &user);
+            self.response(&a.bandwidth, &a.sample_rate, &a.response, &user);
             for sink in &a.sinks {
                 self.reference(&names, sink, "sink", &user);
             }

@@ -85,6 +85,7 @@ cargo xtask gpu-test  # CUDA tests (placeholder until prompt 20)
 cargo xtask deps      # dependency-graph rules only
 cargo xtask schema    # regenerate schema/scenario.schema.json (a test fails while it is stale)
 cargo run -p iqsim-cli -- --help
+cargo run -p iqsim-cli -- run --offline examples/minimal.toml --out <dir>   # then: sim replay <dir>/run/manifest.json
 ```
 
 Property tests use proptest. They run 2048 cases per property by default; set `PROPTEST_CASES=<n>` for a longer run and `PROPTEST_RNG_SEED=<n>` to reproduce a run. Seeds are random by default. When a property fails, proptest saves the failing case under a `proptest-regressions/` directory and replays it first on every later run. Commit those files with the fix, and never delete them to make a test pass. Integration tests under `tests/` have no `lib.rs` beside them, so proptest's default persistence silently saves nothing there. Set `failure_persistence` to `FileFailurePersistence::Direct("proptest-regressions/<file>.txt")`, as `crates/iqsim-core/tests/*_props.rs` does.

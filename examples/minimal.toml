@@ -1,5 +1,7 @@
-# Minimal scenario: one static CW emitter and one receiver with one channel.
+# Minimal scenario: one static CW emitter, one receiver with one channel, and one
+# antenna-port output at the same antenna.
 # Lint it with: sim lint examples/minimal.toml
+# Run it with:  sim run --offline examples/minimal.toml --out /tmp/minimal
 
 schema_version = 1
 epoch = 2026-01-01T00:00:00Z
@@ -10,9 +12,13 @@ run_mode = "offline"
 name = "minimal"
 description = "One static CW emitter at 1090 MHz seen by one receiver."
 
+[render]
+duration = "10 ms"
+block = "1 ms"
+
 [[platforms]]
 name = "beacon"
-position = { lat = "38°53'23.3\"N", lon = "77°02'11.5\"W", alt = "10 m AGL" }
+position = { lat = "38°55'00.0\"N", lon = "77°02'11.5\"W", alt = "10 m AGL" }
 
 [[platforms]]
 name = "site"
@@ -37,10 +43,27 @@ name = "ch0"
 center_frequency = "1090 MHz"
 sample_rate = "10 MS/s"
 bandwidth = "8 MHz"
+front_end = { gain = "30 dB", noise_figure = "5 dB" }
+adc = { full_scale = "-30 dBm", bits = 16 }
 sinks = ["recording"]
+
+[[antenna_ports]]
+name = "port"
+platform = "site"
+mount = "mast"
+center_frequency = "1090 MHz"
+sample_rate = "10 MS/s"
+bandwidth = "8 MHz"
+full_scale = "-40 dBm"
+sinks = ["port_recording"]
 
 [[sinks]]
 name = "recording"
+kind = "sigmf"
+resources = ["scratch_disk"]
+
+[[sinks]]
+name = "port_recording"
 kind = "sigmf"
 resources = ["scratch_disk"]
 

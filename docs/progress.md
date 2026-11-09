@@ -370,3 +370,71 @@ Append one entry per prompt. Newest at the bottom. Each entry covers what was bu
   - **Propagation phase** −f_c·τ in f64 loses the fractional cycle at absurd ranges (2.1 rad at 10¹⁵ m). Such links are now rejected (|f_c·τ| ≤ 2⁴⁰ cycles).
 - It also noted that the determinism test's non-zero check could be met by the CW paths alone, and that both out-of-band CW tones quantized to zero even with culling off. The test now asserts that pulse trains are present in both blocks. A new case renders an 8.3 MHz tone through B_out whose −7.7 MHz image is non-zero: measured 3.8·10⁻⁷ of the unfiltered level, against a 60 dB (10⁻³) stopband.
 - No golden hash changed.
+
+---
+
+## Prompt 6: Receiver chain, SigMF output and first validation checks (2026-11-08)
+
+**Built**
+
+- `iqsim-receiver` (contracts §5.4, §5.5):
+  - `chain`: `ChainConfig` with one `Option` per stage, and `ReceiverChannelState`, the single owner of a channel's state. Stages in order: accumulator → volts; front-end gain (its noise figure sets the noise level); kTBF noise, a correlation of counter-indexed Philox noise with the sampled H_rx scaled to N₀ = k·T₀·F·g²; LO offset at each sample's acquisition instant with the exact modular phase (phase noise is a stub); IQ imbalance and DC; decimation (sampled §5.1 lowpass, carried history); AGC (off by default); ADC quantization and clipping, left-justified in sc16. All f32, every operation separate.
+  - Blocks must arrive in order with contiguous indices; anything else is an error that leaves the state unchanged. Output is identical for any block split, down to 1-sample blocks with every stage on.
+  - `port`: `PortConverter`, integer-only antenna-port conversion (sc16 `round_ties_even(acc/2²⁵)`, clipping is an error; cf32 `f32(acc)·2⁻⁴⁰`).
+- `iqsim-io` (written by Codex CLI to my spec, then reviewed): `sigmf::SigmfWriter` (ci16_le and cf32_le) over a generic `CheckedSampleSink<W: Write>` that checks every write, counts samples and hashes the exact bytes. It never overwrites, and it writes `.sigmf-meta` only on a successful `finish` (flush, `sync_all`, length check). The meta holds only SigMF core fields. Also `read_recording`, `decode_ci16`/`decode_cf32`, and `utc::format_datetime` (integer, picosecond, proleptic Gregorian).
+- `iqsim-contracts::manifest`: `RunManifest` (schema version 1), `BuildIdentity`, `ScenarioRecord`, `AssetKind`/`AssetRecord`/`AssetRegistry` (register with conflict detection, verify through a caller-supplied reader, no I/O), `OutputRecord`, `TruthRecord`, `EventLogRecord` (unused until prompt 16), and canonical JSON. `deterministic_sha256` excludes `backend` and `nondeterministic`.
+- `iqsim-core::NUMERIC_CONTRACT_VERSION = 0`. `iqsim-geo`: `Ecef::from_geodetic` (WGS84, libm).
+- `iqsim-scenario`: `[render]` (duration, block), `response` details for H_rx/B_out, the receiver-chain stages, `fixed_offset` clock and LO models, ADC and antenna-port full scales, and sink `format`. New lint checks for these. Schema regenerated.
+- `iqsim-runtime`:
+  - `plan`: `resolve` → `ResolvedScenario` (every default filled in, serializable, hashed into the manifest) → `RunPlan`. Receiver entity ids come from a hash of the name.
+  - `offline`: `run_offline` (static work list → CPU render → chain or port → SigMF; truth record; manifest) and `replay`. `build.rs` records the rustc release, target, profile and a fingerprint of the workspace sources.
+- `sim run --offline <FILE> --out <DIR> [--threads N]` and `sim replay <MANIFEST> [--threads N]`. Run directory: `consumer/<sink>/<stream>.sigmf-*`, `run/manifest.json`, `run/truth.json`.
+- `examples/minimal.toml` now renders 10 ms: the CW beacon, a channel with a 30 dB / 5 dB NF front end and a −30 dBm ADC, and a new antenna port. `sim run` then `sim replay` succeeds.
+- Tests: 8 chain tests and 2 port unit tests, 2 manifest unit tests, 1 geo test, 11 + 8 io tests (Codex), 9 validation tests in `crates/iqsim-runtime/tests/validation.rs`, and updated CLI and lint tests. Measured:
+  - **Delay:** pulse TOA through gain and the 16-bit ADC, worst 7.6·10⁻⁵ samples (bound 10⁻³).
+  - **Power and in-band level:** six CW tones from DC to the transition band on both taps against Friis·|H(f)|²: worst 0.0004 dB (bound 0.1 dB).
+  - **Noise floor:** total power −0.037 dB against k·T₀·F·G·∫|H_rx|²df (B_n = 13.70 MHz), Welch passband PSD −0.036 dB (bound 0.2 dB).
+  - **Out of band:** a 1030 MHz, 60 dBm emitter into the 1090 MHz, 16 MS/s channel leaves nothing at the +4 MHz fold on either tap (the path is culled), and a 1091 MHz reference keeps its level within 0.1 dB.
+  - **Tap isolation:** H_rx stopband, gain, NF, noise off, seed, clock offset, LO offset, ADC bits, IQ, decimation and AGC each change the virtual-receiver hash and never the antenna-port hash. The port's own full scale and group delay do change it.
+  - **Golden:** `runtime/minimal_rx_ch0`, `runtime/minimal_port` and `runtime/minimal_truth`, plus `io/sigmf_data` and `io/sigmf_meta` (Codex). All are new; no existing golden changed. The test also checks that the manifest hashes match the files and that consumer metadata mentions no truth.
+  - **Truth mapping:** with decimation by 2 and a 13 ns clock offset, truth gives 8 000 output samples at 8 MS/s, the decimation delay, and the shifted acquisition instant and reported label. The antenna port keeps its own mapping.
+  - **Replay:** identical across 4 and 1 threads. Rejected: an edited or removed scenario, a different numeric contract version, lockfile or source fingerprint, a tampered resolved scenario (with and without a matching rehash), a changed or missing asset, an event log, unknown manifest fields, and different output or truth hashes.
+
+**Contracts changed** (`docs/contracts.md`, still version 0)
+
+- New §5.4 (receiver chain, state ownership, handoff) and §5.5 (antenna-port output). §2 output conversion settled. §1.5 entity ids. §6 implemented fields, replay order, run directory, and the canonical JSON decision ("iqsim canonical JSON v1", RFC 8785 except float formatting; prompt 9/10 had been the proposed decision point). §7 SigMF fields. §9 placements. §10 power, noise and out-of-band checks marked tested. §11 new scenario fields and what `sim run` supports.
+
+**Deviations**
+
+- **Bandwidth rule.** Prompt 4 allowed bandwidth = sample rate. A response needs a transition band, so lint now requires bandwidth < stopband ≤ rate (stopband defaults to the rate). Two prompt 4 tests were updated to the new rule; the negative fixtures still pass unchanged.
+- **Scope of `sim run`.** Library items are not resolved yet, so emitters must use the built-in `cw` / `always_on`. MSL and AGL heights are treated as ellipsoidal (no geoid or terrain), flight levels are rejected, mounts are ignored (isotropic antennas at the platform origin), and only SigMF sinks are written. Each is a resolution error, not a silent default.
+- **Clock and LO configuration.** The prompt asks to vary the clock configuration in the tap-isolation test, but perturbed clock maps belong to prompt 15. I added the smallest real models: `fixed_offset` clock (an ideal map with a later epoch) and `fixed_offset` LO (constant frequency error).
+- **Noise needs no carried state.** The design lists filter history among the stateful processes. Noise shaping is instead a correlation over counter-indexed white noise, so each block recomputes its L − 1 sample lookahead. That is deterministic and split-invariant without state. Decimation and AGC do carry state.
+- **Decimation** starts from zero history, so its first (L − 1)/2 outputs are a start-up transient, and it adds (L − 1)/2 input samples of delay. Truth reports that delay; consumer metadata does not.
+- **The manifest records no git commit.** Instead, a source fingerprint over every crate's `Cargo.toml`, `build.rs` and `src/` (plus the root manifest and toolchain file) covers uncommitted edits too, without git at build time.
+- **Effective full scale.** The antenna port's sc16 code 32768 is 2⁴⁰ accumulator LSB, which is `2⁴⁰/lsb_per_volt`, within 2⁻²⁴ relative of the declared V_fs, because the f32 factor defines the scale (§2). The truth record reports it.
+- **`sim replay` checks only.** It re-renders into hashing sinks and writes nothing.
+- **Out of band.** In this pipeline the 1030 MHz CW is culled (|H| ≈ 0), so the alias check is trivially met. The non-culled image level was measured in prompt 5 (render level).
+- `serde_json` now has `float_roundtrip` enabled workspace-wide. Without it a manifest's resolved scenario re-hashed differently after a write/read round trip; replay caught this on the first run.
+- `examples/minimal.toml`: the beacon moved from 15 m to 3 km from the site, so the example is a realistic link that stays inside the antenna port's full scale.
+
+**Independent review (Codex CLI, `high` reasoning, read-only)**
+
+- Codex also wrote `iqsim-io` to a spec I gave it (workspace-write, limited to that crate). I reviewed it before wiring it in and changed nothing.
+- The review found four issues. All are fixed, each with a test:
+  - **P1, build identity.** A code change with the same version and lockfile kept the same identity, so replay would render with different code. Added `source_sha256` (above), and a replay test for it.
+  - **P1, truth time mapping.** Truth reported render-rate counts and delays without saying which index space they were in, ignored decimation, and did not change with a clock offset. Truth now has a per-stream mapping (rates, counts, index factor, decimation delay, first-sample acquisition instant and reported label, effective full scale). `delay_samples` was renamed to `delay_render_samples`. The `runtime/minimal_truth` golden was re-blessed for this; it is new in this prompt, and both sample goldens are unchanged.
+  - **P2, port scale.** Conversion assumed the declared V_fs/2⁴⁰ while the f32 factor defines the scale, so a value just below full scale could report a false clip. Defined and documented the effective full scale (`TargetScale::full_scale_effective_volts`).
+  - **P2, ADC overdrive.** A finite but huge value (`dc_i = 1e35`) overflowed the f32 ADC multiply and failed the run instead of clipping. The input is now checked for finiteness first, and ±∞ after scaling clamps to a clip. My own pass had already fixed the related i64-range case (`i64::MAX` input).
+
+**Dependencies**
+
+- No new external crates. `sha2` is also a build-dependency of `iqsim-runtime`, for the source fingerprint. `serde_json` gains the `float_roundtrip` feature, which adds no packages. Workspace dependencies added to more crates: contracts (serde, serde_json, sha2, hex), io (sha2, hex, serde_json), receiver (libm; dev libm), geo (libm), and runtime (libm, serde, serde_json, sha2, hex). No internal dependency edges were added; `cargo xtask deps` passes.
+- `iqsim-runtime/build.rs` only runs the configured `rustc -vV` and reads `TARGET`/`PROFILE`. It never touches the network.
+
+**Open questions**
+
+- The truth record is per link (geometry and level), not per emission. Parquet truth and consumer-knowledge exports arrive with the exports prompt.
+- Consumer metadata should label the decimation group delay and start-up transient once the receiver-profile prompt pins how a consumer learns about them. Truth already records the delay.
+- AGC is a simple multiplicative loop. A receiver-profile AGC (attack/decay in time constants, dB-domain) may replace it.
+- `ResolvedScenario` is the first canonical "resolved scenario". Library and IQ-file prompts must add their items to it and register assets so replay covers them.

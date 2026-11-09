@@ -9,6 +9,12 @@ publish.workspace = true
 [dependencies]
 iqsim-core.workspace = true
 iqsim-contracts.workspace = true
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+iqsim-testkit.workspace = true
 
 [lints]
 workspace = true

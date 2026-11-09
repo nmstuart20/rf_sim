@@ -44,6 +44,10 @@
         "$ref": "#/$defs/Receiver"
       }
     },
+    "render": {
+      "description": "Render settings for `sim run` (duration and block length).",
+      "$ref": "#/$defs/Render"
+    },
     "resources": {
       "description": "Shared hardware resources (NIC, disk, USB, PCIe) that sinks use.",
       "type": "array",
@@ -85,6 +89,56 @@
     "run_mode"
   ],
   "$defs": {
+    "AdcSpec": {
+      "description": "The virtual ADC (receiver chain stage 7).",
+      "type": "object",
+      "properties": {
+        "bits": {
+          "description": "Resolution, 2 to 16 bits (default 16).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "enabled": {
+          "description": "Quantize and clip (default true). Off, the channel writes unquantized cf32.",
+          "type": "boolean"
+        },
+        "full_scale": {
+          "description": "Full scale: the power of a CW tone whose components just reach the clip level\n(default 0 dBm).",
+          "$ref": "#/$defs/Power"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AgcSpec": {
+      "description": "Automatic gain control (receiver chain stage 6, off unless given).",
+      "type": "object",
+      "properties": {
+        "attack": {
+          "description": "Power-tracker coefficient, 0 < attack ≤ 1 (default 0.01).",
+          "type": "number",
+          "format": "double"
+        },
+        "max_gain": {
+          "description": "Largest AGC gain (default 40 dB).",
+          "$ref": "#/$defs/Gain"
+        },
+        "min_gain": {
+          "description": "Smallest AGC gain (default −40 dB).",
+          "$ref": "#/$defs/Gain"
+        },
+        "step": {
+          "description": "Gain step, 0 < step ≤ 1 (default 0.01).",
+          "type": "number",
+          "format": "double"
+        },
+        "target": {
+          "description": "Target RMS level relative to the ADC full scale (default −12 dB).",
+          "$ref": "#/$defs/Gain"
+        }
+      },
+      "additionalProperties": false
+    },
     "Altitude": {
       "description": "A altitude with a unit (m, km, ft, nmi, FL), written as a string, e.g. \"35000 ft MSL\". Units are case-sensitive.",
       "type": "string",
@@ -93,17 +147,28 @@
       ],
       "pattern": "^\\s*(?:FL\\s*[0-9]{1,3}|[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:m|km|ft|nmi)\\s+(?:MSL|AGL|HAE|ellipsoid))\\s*$"
     },
+    "Angle": {
+      "description": "A angle with a unit (deg, °, rad, DMS (12°34'56.7\" or 12d34m56.7s)), written as a string, e.g. \"12.5 deg\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "12.5 deg"
+      ]
+    },
     "AntennaPort": {
       "description": "An antenna-port output: the field at an antenna, band-limited by B_out, with\nno virtual-receiver effects (contracts §5).",
       "type": "object",
       "properties": {
         "bandwidth": {
-          "description": "Bandwidth of the output response B_out (at most the sample rate).",
+          "description": "Bandwidth of the output response B_out (below its stopband).",
           "$ref": "#/$defs/Frequency"
         },
         "center_frequency": {
           "description": "Output centre frequency.",
           "$ref": "#/$defs/Frequency"
+        },
+        "full_scale": {
+          "description": "Output full scale: the power of a CW tone at sc16 code 32768 (default 0 dBm).",
+          "$ref": "#/$defs/Power"
         },
         "mount": {
           "description": "The mount the antenna sits on (default: the platform origin).",
@@ -116,6 +181,10 @@
         "platform": {
           "description": "The platform carrying the antenna.",
           "$ref": "#/$defs/Ident"
+        },
+        "response": {
+          "description": "B_out details beyond the bandwidth.",
+          "$ref": "#/$defs/ResponseDetail"
         },
         "sample_rate": {
           "description": "Complex output sample rate.",
@@ -142,8 +211,16 @@
       "description": "One tuned channel of a virtual receiver.",
       "type": "object",
       "properties": {
+        "adc": {
+          "description": "The virtual ADC (defaults when absent: 0 dBm full scale, 16 bits, on).",
+          "$ref": "#/$defs/AdcSpec"
+        },
+        "agc": {
+          "description": "Automatic gain control (off when absent).",
+          "$ref": "#/$defs/AgcSpec"
+        },
         "bandwidth": {
-          "description": "Usable bandwidth of the receiver response H_rx (at most the sample rate).",
+          "description": "Passband width of the receiver response H_rx (below its stopband).",
           "$ref": "#/$defs/Frequency"
         },
         "center_frequency": {
@@ -151,16 +228,32 @@
           "$ref": "#/$defs/Frequency"
         },
         "clock": {
-          "description": "Sampling clock model (placeholder: only `ideal`).",
+          "description": "Sampling clock model.",
           "$ref": "#/$defs/ClockModelSpec"
         },
+        "decimation": {
+          "description": "Digital decimation (off when absent).",
+          "$ref": "#/$defs/DecimationSpec"
+        },
+        "front_end": {
+          "description": "Front-end gain and noise figure (off when absent: 0 dB gain, 0 dB noise figure).",
+          "$ref": "#/$defs/FrontEndSpec"
+        },
+        "iq": {
+          "description": "IQ imbalance and DC offset (off when absent).",
+          "$ref": "#/$defs/IqSpec"
+        },
         "lo": {
-          "description": "Local-oscillator model (placeholder: only `ideal`).",
+          "description": "Local-oscillator model.",
           "$ref": "#/$defs/LoModelSpec"
         },
         "name": {
           "description": "Name, unique within the receiver.",
           "$ref": "#/$defs/Ident"
+        },
+        "response": {
+          "description": "H_rx details beyond the bandwidth.",
+          "$ref": "#/$defs/ResponseDetail"
         },
         "sample_rate": {
           "description": "Complex sample rate.",
@@ -172,6 +265,10 @@
           "items": {
             "$ref": "#/$defs/Ident"
           }
+        },
+        "thermal_noise": {
+          "description": "Thermal noise kTBF (default true).",
+          "type": "boolean"
         }
       },
       "additionalProperties": false,
@@ -189,16 +286,25 @@
           "description": "Samples exactly at the nominal instants (`IdealClockMap`).",
           "type": "string",
           "const": "ideal"
+        },
+        {
+          "description": "Nominal instants shifted by a constant `offset` (an ideal map with a later epoch).",
+          "type": "string",
+          "const": "fixed_offset"
         }
       ]
     },
     "ClockModelSpec": {
-      "description": "A sampling-clock model (placeholder).",
+      "description": "A sampling-clock model.",
       "type": "object",
       "properties": {
         "model": {
           "description": "The clock model.",
           "$ref": "#/$defs/ClockModel"
+        },
+        "offset": {
+          "description": "Sampling-instant offset for `fixed_offset`: every sample is acquired this much\nlater than nominal.",
+          "$ref": "#/$defs/Duration"
         }
       },
       "additionalProperties": false,
@@ -213,6 +319,42 @@
         "1 Gb/s"
       ],
       "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:b/s|kb/s|Mb/s|Gb/s|B/s|kB/s|MB/s|GB/s)\\s*$"
+    },
+    "DecimationSpec": {
+      "description": "Digital decimation (receiver chain stage 5).",
+      "type": "object",
+      "properties": {
+        "attenuation": {
+          "description": "Stopband attenuation (default 80 dB).",
+          "$ref": "#/$defs/Gain"
+        },
+        "bandwidth": {
+          "description": "Passband full width (default 0.8 × the output rate).",
+          "$ref": "#/$defs/Frequency"
+        },
+        "factor": {
+          "description": "Decimation factor, at least 2.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "stopband": {
+          "description": "Stopband full width (default the output rate).",
+          "$ref": "#/$defs/Frequency"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "factor"
+      ]
+    },
+    "Duration": {
+      "description": "A duration with a unit (s, ms, us, µs, ns, ps), written as a string, e.g. \"20.3 us\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "20.3 us"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:s|ms|us|µs|μs|ns|ps)\\s*$"
     },
     "Emitter": {
       "description": "An RF emitter on a platform.",
@@ -270,10 +412,63 @@
       ],
       "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:Hz|kHz|MHz|GHz)\\s*$"
     },
+    "FrontEndSpec": {
+      "description": "Front-end gain and noise figure (receiver chain stage 1).",
+      "type": "object",
+      "properties": {
+        "gain": {
+          "description": "Power gain from the receiver input to the ADC input.",
+          "$ref": "#/$defs/Gain"
+        },
+        "noise_figure": {
+          "description": "Noise figure (default 0 dB).",
+          "$ref": "#/$defs/Gain"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "gain"
+      ]
+    },
+    "Gain": {
+      "description": "A gain with a unit (dB, dBi), written as a string, e.g. \"3 dBi\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "3 dBi"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:dB|dBi)\\s*$"
+    },
     "Ident": {
       "description": "An entity name or a reference to one: ASCII letters, digits, '_' and '-'.",
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+    },
+    "IqSpec": {
+      "description": "IQ imbalance and DC offset (receiver chain stage 4).",
+      "type": "object",
+      "properties": {
+        "dc_i": {
+          "description": "DC offset on I as a fraction of the ADC full scale (default 0).",
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "dc_q": {
+          "description": "DC offset on Q as a fraction of the ADC full scale (default 0).",
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "gain_imbalance": {
+          "description": "Q-branch gain relative to I (default 0 dB).",
+          "$ref": "#/$defs/Gain"
+        },
+        "phase_skew": {
+          "description": "Quadrature skew (default 0°, below 45°).",
+          "$ref": "#/$defs/Angle"
+        }
+      },
+      "additionalProperties": false
     },
     "Latitude": {
       "description": "latitude in degrees: a number (N positive) or a string in decimal degrees or degrees-minutes-seconds with an optional N/S letter, e.g. \"38°53'23.3\"N\".",
@@ -315,16 +510,25 @@
           "description": "No frequency or phase error.",
           "type": "string",
           "const": "ideal"
+        },
+        {
+          "description": "A constant frequency error `offset`; phase noise is not modelled yet.",
+          "type": "string",
+          "const": "fixed_offset"
         }
       ]
     },
     "LoModelSpec": {
-      "description": "A local-oscillator model (placeholder).",
+      "description": "A local-oscillator model.",
       "type": "object",
       "properties": {
         "model": {
           "description": "The LO model.",
           "$ref": "#/$defs/LoModel"
+        },
+        "offset": {
+          "description": "LO frequency error for `fixed_offset` (LO minus nominal).",
+          "$ref": "#/$defs/Frequency"
         }
       },
       "additionalProperties": false,
@@ -517,6 +721,24 @@
         "channels"
       ]
     },
+    "Render": {
+      "description": "Render settings (`sim run`).",
+      "type": "object",
+      "properties": {
+        "block": {
+          "description": "Block length (default 1 ms). It must be a whole number of samples at every\nchannel and antenna-port rate.",
+          "$ref": "#/$defs/Duration"
+        },
+        "duration": {
+          "description": "How much truth time to render, from the epoch.",
+          "$ref": "#/$defs/Duration"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "duration"
+      ]
+    },
     "Resource": {
       "description": "A shared hardware resource with an optional usable capacity (contracts §8).",
       "type": "object",
@@ -565,6 +787,25 @@
         }
       ]
     },
+    "ResponseDetail": {
+      "description": "Details of a pre-sampling tap response (H_rx or B_out), beyond its bandwidth.\n\nThe response is a linear-phase lowpass with passband edge `bandwidth / 2` and\nstopband edge `stopband / 2` around the centre (contracts §5.1).",
+      "type": "object",
+      "properties": {
+        "attenuation": {
+          "description": "Minimum stopband attenuation (default 80 dB, 20 to 200 dB).",
+          "$ref": "#/$defs/Gain"
+        },
+        "group_delay": {
+          "description": "Group delay (default 0, at most 1 ms).",
+          "$ref": "#/$defs/Duration"
+        },
+        "stopband": {
+          "description": "Full width at which the stopband begins (default: the complex sample rate).\nIt must exceed the bandwidth and be at most the sample rate.",
+          "$ref": "#/$defs/Frequency"
+        }
+      },
+      "additionalProperties": false
+    },
     "RunMode": {
       "description": "How a run is paced.",
       "oneOf": [
@@ -580,6 +821,21 @@
         }
       ]
     },
+    "SampleFormatSpec": {
+      "description": "Sample formats a sink can write.",
+      "oneOf": [
+        {
+          "description": "Complex int16, little-endian (sc16).",
+          "type": "string",
+          "const": "ci16_le"
+        },
+        {
+          "description": "Complex float32, little-endian.",
+          "type": "string",
+          "const": "cf32_le"
+        }
+      ]
+    },
     "SampleRate": {
       "description": "A sample rate with a unit (S/s, kS/s, MS/s, GS/s), written as a string, e.g. \"61.44 MS/s\". Units are case-sensitive.",
       "type": "string",
@@ -592,6 +848,10 @@
       "description": "An output sink (placeholder: endpoint and file settings come with the sinks).",
       "type": "object",
       "properties": {
+        "format": {
+          "description": "Sample format (default `ci16_le`).",
+          "$ref": "#/$defs/SampleFormatSpec"
+        },
         "kind": {
           "description": "Sink type.",
           "$ref": "#/$defs/SinkKind"

@@ -47,10 +47,10 @@ fn help_and_no_arguments_list_commands() {
                 .unwrap()
                 .to_owned()
         };
-        assert!(!line("lint").contains("not yet implemented"));
-        for command in ["dry-run", "run", "replay"] {
-            assert!(line(command).contains("not yet implemented"));
+        for command in ["lint", "run", "replay"] {
+            assert!(!line(command).contains("not yet implemented"));
         }
+        assert!(line("dry-run").contains("not yet implemented"));
     }
 }
 
@@ -61,7 +61,11 @@ fn unsupported_commands_and_bad_arguments_exit_two() {
         vec!["lint", "a.toml", "b.toml"],
         vec!["dry-run"],
         vec!["run"],
+        vec!["run", "x.toml", "--out", "d"],
+        vec!["run", "--offline", "x.toml"],
+        vec!["run", "--offline", "x.toml", "--out", "d", "--threads", "0"],
         vec!["replay"],
+        vec!["replay", "a.json", "b.json"],
         vec!["unknown"],
         vec!["--unknown"],
         vec!["--version", "extra"],
@@ -143,4 +147,60 @@ fn negative_fixtures_report_file_line_column() {
         );
         assert!(stderr.trim_end().ends_with("error") || stderr.trim_end().ends_with("errors"));
     }
+}
+
+#[test]
+fn run_offline_then_replay_succeeds_and_rejects_reuse_of_the_output() {
+    let dir = std::env::temp_dir().join(format!("iqsim-cli-run-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let scenario = workspace_file("examples/minimal.toml");
+    let out = dir.join("out");
+    let run = sim(&[
+        "run",
+        "--offline",
+        scenario.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--threads",
+        "2",
+    ]);
+    let stdout = String::from_utf8(run.stdout).unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("consumer/recording/rx.ch0.sigmf-data: 100000 samples"));
+    assert!(stdout.contains("consumer/port_recording/port.sigmf-data: 100000 samples"));
+    let manifest = out.join("run/manifest.json");
+    let replay = sim(&["replay", manifest.to_str().unwrap()]);
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        String::from_utf8(replay.stdout)
+            .unwrap()
+            .contains("replay ok, 2 outputs match")
+    );
+    // A second run into the same directory is refused.
+    let again = sim(&[
+        "run",
+        "--offline",
+        scenario.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(
+        String::from_utf8(again.stderr)
+            .unwrap()
+            .contains("not empty")
+    );
+    let missing = sim(&["replay", dir.join("nope.json").to_str().unwrap()]);
+    assert_eq!(missing.status.code(), Some(1));
+    fs::remove_dir_all(&dir).unwrap();
 }

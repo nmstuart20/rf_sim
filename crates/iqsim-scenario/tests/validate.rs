@@ -48,7 +48,7 @@ platform = "q"
 name = "c"
 center_frequency = "1030 MHz"
 sample_rate = "20 MS/s"
-bandwidth = "20 MHz"
+bandwidth = "18 MHz"
 
 [[receivers.channels]]
 name = "c"
@@ -78,8 +78,12 @@ bandwidth = "-1 MHz"
     );
 }
 
+/// The response needs 0 < bandwidth < stopband ≤ rate, compared exactly: a bandwidth
+/// equal to a fractional rate is caught (no transition band below the default
+/// stopband), and one a micro-hertz above it exceeds the rate. (Prompt 4 allowed
+/// bandwidth = rate; prompt 6 needs a transition band to build H_rx.)
 #[test]
-fn bandwidth_may_equal_a_fractional_sample_rate() {
+fn bandwidth_is_compared_exactly_against_a_fractional_sample_rate() {
     let body = r#"
 [[platforms]]
 name = "p"
@@ -96,12 +100,33 @@ platform = "p"
 center_frequency = "1090 MHz"
 sample_rate = "2.5 S/s"
 bandwidth = "2.500001 Hz"
+[[antenna_ports]]
+name = "port3"
+platform = "p"
+center_frequency = "1090 MHz"
+sample_rate = "2.5 S/s"
+bandwidth = "2.499999 Hz"
+[[antenna_ports]]
+name = "port4"
+platform = "p"
+center_frequency = "1090 MHz"
+sample_rate = "2.5 S/s"
+bandwidth = "2 Hz"
+response = { stopband = "2 Hz" }
 "#;
     let found = errors(body);
-    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(found.len(), 3, "{found:#?}");
     assert!(found[0].2.contains(
+        "antenna port \"port\": bandwidth 2.5 Hz leaves no transition band below the default stopband"
+    ));
+    assert!(found[1].2.contains(
         "antenna port \"port2\": bandwidth 2.500001 Hz exceeds the complex sample rate 2.5 S/s"
     ));
+    assert!(
+        found[2]
+            .2
+            .contains("stopband 2 Hz must be wider than the bandwidth 2 Hz")
+    );
 }
 
 #[test]
