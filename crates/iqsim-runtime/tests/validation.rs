@@ -736,7 +736,9 @@ fn replay_matches_and_rejects_changed_inputs() {
     .unwrap();
     let records = reg.records();
     edit(&|m| m.assets = records.clone());
-    replay(&manifest, RunOptions { threads: 2 }).unwrap();
+    // Since prompt 7 the asset list must be exactly what the scenario resolves to, so
+    // an extra record is rejected; file verification still comes first.
+    expect("extra asset", "asset list differs");
     fs::write(&asset, b"pattern v2").unwrap();
     expect("asset changed", "changed since the run was recorded");
     fs::remove_file(&asset).unwrap();
@@ -800,12 +802,10 @@ fn runs_reject_unsafe_outputs_and_unsupported_features() {
             base.replace("block = \"1 ms\"", "block = \"1.00001 ms\""),
             "whole number of samples",
         ),
+        // Flight levels resolve since prompt 7; a missing geoid grid does not.
         (
-            base.replace(
-                "alt = \"0 m HAE\" }\n\n[[platforms]]\nname = \"far\"",
-                "alt = \"FL100\" }\n\n[[platforms]]\nname = \"far\"",
-            ),
-            "flight levels",
+            format!("{base}\n[world]\ngeoid = {{ path = \"missing-egm96-5.pgm\" }}\n"),
+            "world.geoid",
         ),
     ] {
         fs::write(&file, &edit).unwrap();

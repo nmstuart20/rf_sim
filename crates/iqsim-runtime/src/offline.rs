@@ -50,7 +50,10 @@ use iqsim_receiver::{
 use iqsim_render::{Backend, CpuBackend, RenderError};
 use serde_json::{Value, json};
 
-use crate::plan::{ResolveError, ResolvedScenario, RunPlan, StreamPlan, resolve};
+use crate::plan::{
+    ResolveError, ResolvedGeoid, ResolvedScenario, RunPlan, StreamPlan, resolution_warnings,
+    resolve,
+};
 use crate::static_scene::{SceneError, StaticSceneBuilder};
 
 /// A failed run or replay.
@@ -432,6 +435,35 @@ pub fn asset_registry(resolved: &ResolvedScenario) -> Result<AssetRegistry, RunE
         )
         .map_err(|e| RunError::Io(e.to_string()))?;
     }
+    if let ResolvedGeoid::Grid {
+        path,
+        byte_len,
+        sha256,
+        width,
+        height,
+        offset_m,
+        scale_m,
+        interpolation,
+    } = &resolved.world.geoid
+    {
+        let meta = json!({
+            "width": width,
+            "height": height,
+            "offset_m": offset_m,
+            "scale_m": scale_m,
+            "interpolation": interpolation,
+        });
+        reg.register_digest(
+            AssetKind::GeoidGrid,
+            "geoid",
+            path,
+            *byte_len,
+            sha(sha256)?,
+            iqsim_geo::geoid::GEOID_FORMAT,
+            Some(&meta),
+        )
+        .map_err(|e| RunError::Io(e.to_string()))?;
+    }
     Ok(reg)
 }
 
@@ -541,6 +573,7 @@ pub fn run_offline(
         block_ps: plan.resolved.block_ps,
         duration_ps: plan.resolved.duration_ps,
         assets: asset_registry(&plan.resolved)?.records(),
+        warnings: resolution_warnings(&plan.resolved),
         event_log: None,
         outputs,
         truth: TruthRecord {
@@ -625,6 +658,19 @@ pub fn replay(manifest_path: &Path, options: RunOptions) -> Result<ReplayReport,
     {
         return Err(RunError::Replay(
             "seed, block or duration differ from the resolved scenario".to_owned(),
+        ));
+    }
+    if m.warnings != resolution_warnings(&loaded.resolved) {
+        return Err(RunError::Replay(
+            "the manifest's warnings differ from the resolved scenario's".to_owned(),
+        ));
+    }
+    // Every asset the resolved scenario needs, with the same identity and metadata
+    // (review fix: an omitted or edited record used to pass, because only the
+    // listed files were verified).
+    if asset_registry(&loaded.resolved)?.records() != m.assets {
+        return Err(RunError::Replay(
+            "the manifest's asset list differs from what the scenario resolves to".to_owned(),
         ));
     }
 

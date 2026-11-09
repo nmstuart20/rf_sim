@@ -283,6 +283,56 @@ impl fmt::Display for Speed {
 
 text_quantity_impls!(Speed, Some(unit_pattern(SPEED.units)));
 
+// ---------------------------------------------------------------- Pressure
+
+static PRESSURE: QuantityKind = QuantityKind {
+    name: "pressure",
+    units: &["Pa", "hPa", "mbar", "inHg"],
+    example: "1013.25 hPa",
+};
+
+/// A signed pressure (or pressure difference) in pascals. Units: Pa, hPa, mbar
+/// (= hPa), inHg (conventional, 3386.389 Pa).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Pressure {
+    pascals: f64,
+}
+
+impl Pressure {
+    /// A pressure of `pascals`. `None` unless finite.
+    pub fn from_pascals(pascals: f64) -> Option<Self> {
+        pascals.is_finite().then_some(Self { pascals })
+    }
+
+    /// The pressure in pascals.
+    pub fn pascals(self) -> f64 {
+        self.pascals
+    }
+}
+
+impl TextQuantity for Pressure {
+    const KIND: &'static QuantityKind = &PRESSURE;
+
+    fn parse_text(text: &str) -> Result<Self, UnitError> {
+        let (value, unit) = number_and_unit(Self::KIND, text)?;
+        let pascals = match unit {
+            "Pa" => exact_f64(Self::KIND, text, value, 1, 0),
+            "hPa" | "mbar" => exact_f64(Self::KIND, text, value, 1, 2),
+            "inHg" => exact_f64(Self::KIND, text, value, 3_386_389, -3),
+            _ => return Err(unknown(Self::KIND, unit)),
+        }?;
+        Ok(Self { pascals })
+    }
+}
+
+impl fmt::Display for Pressure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} Pa", self.pascals)
+    }
+}
+
+text_quantity_impls!(Pressure, Some(unit_pattern(PRESSURE.units)));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +372,18 @@ mod tests {
         assert_eq!(v("36 km/h"), Ok(10.0));
         assert_eq!(v("-5 m/s"), Ok(-5.0));
         assert!(matches!(v("250 knots"), Err(UnitError::UnknownUnit { .. })));
+    }
+
+    #[test]
+    fn pressure_units() {
+        let p = |s: &str| s.parse::<Pressure>().map(Pressure::pascals);
+        assert_eq!(p("1013.25 hPa"), Ok(101_325.0));
+        assert_eq!(p("-3.5 mbar"), Ok(-350.0));
+        assert_eq!(p("+12 Pa"), Ok(12.0));
+        assert_eq!(p("29.92 inHg"), Ok(101_320.758_88));
+        assert_eq!(p("1 inHg"), Ok(3386.389));
+        assert!(matches!(p("10 hpa"), Err(UnitError::UnknownUnit { .. })));
+        assert!(matches!(p("1e400 Pa"), Err(UnitError::OutOfRange { .. })));
+        assert_eq!("2 hPa".parse::<Pressure>().unwrap().to_string(), "200 Pa");
     }
 }

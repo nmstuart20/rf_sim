@@ -503,3 +503,67 @@ Append one entry per prompt. Newest at the bottom. Each entry covers what was bu
 - Moving geometry (phase 3) makes the coordinate cubic. `validate()` must then bound the coordinate's interior (as for pulses), and the window must cover the extremum.
 - For live or generated continuous sources, stage-1 lookahead (supp K + 3 cells) must enter the commit boundary's filter lookahead (§4).
 - A recording whose content reaches native Nyquist is attenuated by φ's transition (0.8–1.0 × rate by default). That is the model, not an error, but users replaying full-band captures may want a wider φ.
+
+---
+
+## Prompt 7: Frames, geodesy and altitude (2026-11-09)
+
+**Built** (`iqsim-geo`, all f64 through `libm`, fixed operation order; contracts §12)
+
+- `vec`: `Vec3` and `Mat3`. `geodetic`: `Ecef` (moved here, forward bits unchanged), `Geodetic`, and the inverse by Bowring's iteration (stop at |Δφ| ≤ 10⁻¹⁵ rad, cap 8, domain |r| ≥ 1000 km, explicit polar axis, λ in (−180°, 180°], |r| ≤ 10¹² m).
+- `eci`: the pseudo-inertial ECI frame (= ECEF at the epoch, WGS84 ω_E) and `earth_rotation_angle`, reduced mod 2π in i128 from the `AcqInstant`, then an exact 64-bit turn fraction times a double-double 2π (≤ 0.5 ulp + 3.5·10⁻¹⁹ rad at any time in the truth-time range); position, free-vector and velocity transforms.
+- `quat`: Hamilton `Quat`, `q_a_b` naming (frame b → frame a, `v_a = q ⊗ v_b ⊗ q*`, both readings documented), `*` composition, axis-angle, aerospace 3-2-1 Euler both ways, matrix both ways (Shepperd). `ned`: `LocalNed` (geodetic down). `frames`: `PlatformPose` (body from `q_ned_body`) and `Mount` (antenna frame and lever arm).
+- `geoid`: GeographicLib PGM grids (strict header and size checks), bilinear interpolation in GeographicLib's order with longitude wrap and pole rows; `Geoid::{Zero, Grid}`.
+- `atmosphere`: ISA layers −5…51 km geopotential, both directions in closed form, geometric ↔ geopotential, and the local pressure offset as a pressure scale factor. `altitude`: `AltitudeModel`, ellipsoid → MSL → pressure altitude → Gillham, and the inverse for flight levels.
+- `gillham` (written by Codex CLI to my spec, in a separate git worktree, then reviewed; unchanged): Gray-coded 500 ft bands plus the 5-state C code, encode/decode, named bits, wire order, squawk octal, rounding to the nearest 100 ft with ties up.
+- `iqsim-units`: `Pressure` (Pa, hPa, mbar, inHg). `iqsim-scenario`: `[world] geoid = { path }` and `pressure_offset`, with lint rules; schema regenerated.
+- `iqsim-runtime`: resolution reads the grid once and records `world` (geoid model, file SHA-256, length, header values; pressure offset) in the resolved scenario (`RESOLVER_VERSION` 2). MSL heights add N; `FLnnn` positions resolve through the inverse chain; AGL is unchanged. The manifest (schema 2) gains `warnings`, with the explicit zero-geoid warning, and registers a configured grid as asset `geoid` (`geoid_grid`, `geographiclib-pgm`, header metadata hash). Replay checks the warnings, and that the asset list is exactly what the re-resolved scenario registers. `sim run` prints warnings to stderr.
+- Tests: geo 24 unit + 19 integration (geodesy 7, geoid 4, Gillham 8), units 1, scenario 1, runtime 3 (`tests/world.rs`), and one updated validation case. Measured:
+  - **Forward** geodetic → ECEF against PROJ 9.8.1 and a 60-digit mpmath reference at 544 points (poles, ±180°, equator, −11 km to 3.844·10⁸ m, random): worst **7.9·10⁻⁸ m**.
+  - **Inverse** against mpmath at 764 points (including random directions from 6340 km to 43 000 km and points within 1 mm of the polar axis): lat 7.2·10⁻⁸ m, lon 1.4·10⁻⁷ m, h 6.0·10⁻⁸ m as arc lengths, **at most 3 Bowring steps**. Bound 10⁻⁶ m per dimension (contracts §12.2).
+  - Round-trip properties (2048 cases each) both ways, from r = 1000 km to 4·10⁸ m.
+  - **Earth rotation angle** at 212 instants (both ends of the i64 ps range, random u64 fractions) within 1 ulp of mpmath.
+  - NED, body and antenna axes against hand-computed cases; quaternion identities (ij = k, composition order, matrix and Euler round trips).
+  - Geoid: synthetic grids, exact at nodes, the bilinear weights written independently inside cells and across the 0°/360° seam, wrap of −10° and 750°, the south-pole row, and 11 malformed files.
+  - ISA: published US 1976 base pressures within 2·10⁻⁷ relative, round trips over −5…51 km within 10⁻⁷ m, continuity at layer bases, an independent troposphere closed form for the pressure offset (QNH 1023.25 hPa: −273 ft at sea level).
+  - **Gillham: all 1280 rows** of the AirSport Avionics published table (bits and squawk), all 4096 wire values (exactly 1280 valid, each round-trips), the one-bit-change Gray property, rounding at ±50 ft and the range ends.
+  - Runtime: the zero-geoid warning and explicit `model = "zero"`; a grid moves an MSL site by exactly N along the normal while an AGL beacon stays; one changed grid byte or a missing grid fails replay before rendering; a truncated grid fails resolution; FL350 with −20 hPa resolves to a position whose forward chain reports 35 000 ft (±10⁻⁶ ft).
+  - **No golden hash changed** (MSL + zero geoid = the old ellipsoidal heights, bit for bit).
+
+**Contracts changed** (numeric contract still version 0; §10 decision 10 is prompt 9's)
+
+- New §12 (frames, ECI and the integer angle reduction, geodetic method, tolerances with the Ka-band justification, NED/body/antenna, quaternion convention, geoid format and fallback, ISA, pressure offset, Gillham). §6: manifest schema 2 (`warnings`, `world`, geoid asset), resolver version 2. §9: iqsim-geo placement. §11.2: `Pressure`. §11.4: `[world]`, and what `sim run` supports now.
+
+**Decisions and deviations**
+
+- **Tolerances.** 10⁻⁶ m for positions and heights (scale-aware beyond 2³⁰ m), angles as arc lengths in the same bound, against the Ka-band phase budget (15 µm of path for 0.01 rad at 31 GHz; 1 µm costs 6.5 %). The prompt's 10⁻⁶ m initial value is kept.
+- **Second oracle.** The Python GeographicLib port has no `Geocentric` class, pymap3d's non-iterative method is not µm-accurate, and PROJ's own inverse is only ~10⁻⁵ m at the surface (centimetres at 2000 km). So the inverse is held to a 60-digit mpmath fixed-point reference, and PROJ is a loose cross-check near the surface. PROJ and mpmath agree on the forward map to 8·10⁻⁸ m.
+- **ISA gas constant.** R = R*/M₀ = 287.053 07 (US 1976), whose computed base pressures reproduce the published table; ICAO Doc 7488's rounded 287.052 87 does not (2·10⁻⁶ off at 20 km). The difference is about 8 mm of pressure altitude at FL400.
+- **Gillham range** is −1200 ft to 126 700 ft, the full published table, rather than ICAO's nominal −1000 ft lower bound; the two extra codes exist in every table.
+- **Geoid format**: GeographicLib PGM only (the format of the freely distributed EGM96/EGM2008 grids). The optional check against a real `egm96-5.pgm` in the plan was dropped: without GeographicLib's C++ `GeoidEval` there was no independent evaluator to take reference values from, and the interpolation is tested exactly on synthetic grids.
+- **Flight levels now resolve** (prompt 6 rejected them) through the inverse chain, because this prompt builds it. **AGL is unchanged** (taken as ellipsoidal) until terrain in phase 8; with a geoid grid that is inconsistent with MSL, and the resolver docs say so.
+- **The zero-geoid fallback** is recorded twice: explicitly in the resolved scenario (`model = "zero"`, so it is part of the resolved hash) and as a manifest warning, which replay re-derives and compares.
+- **The Hamilton product is `Quat * Quat`** (clippy rejects a `mul` method), so composition reads `q_a_c = q_a_b * q_b_c`.
+- `Ecef` moved from `lib.rs` to `geodetic` (re-exported; same API). `Ecef::to_geodetic_with_steps` exposes the step count for tests.
+- The runtime reads the geoid file twice per run start (resolution, then the asset digest), like IQ files.
+
+**Independent review (Codex CLI, `high` reasoning, read-only)**
+
+- Codex also wrote `gillham.rs` to my spec in a separate git worktree (so my in-progress edits could not break its builds). It matched all 1280 table rows on the first pass; I reviewed it and changed nothing.
+- The review found no P1 issues. It found five P2 issues and one P3 issue, all fixed, each with a regression test. No golden changed.
+  - **P2, gimbal lock.** `to_euler_zyx` returned (0, π/2, 0) for `(0.5, 0.5, 0.5, −0.5)`, a different rotation. At cos(pitch) < 10⁻⁸ roll is now 0 and yaw takes atan2(−C₀₁, C₁₁). Pitch now uses atan2 instead of asin, which was 1.5·10⁻⁸ rad off near ±90°. A test rebuilds the rotation at and near both locks.
+  - **P2, replay asset list.** Removing the geoid asset or editing its metadata hash still replayed, because only the listed files were verified. Replay now requires the list to equal the re-resolved scenario's. This tightened a prompt 6 test that injected an unused extra asset: it is now rejected (`asset list differs`).
+  - **P2, Earth-angle bound.** The old `f64(r)·unit` conversion reached 1.524 ulp at ps = 5 858 921 581 365 495 166, above the documented 1.5, and the test's 2-ulp tolerance hid it. It now uses the exact turn fraction and the double-double product, and the test holds 1 ulp at 212 instants, including that one.
+  - **P2, PGM comments.** A comment directly after maxval, and comments ending in CR alone, were rejected or mis-parsed. Both follow the netpbm rules now.
+  - **P2, huge inputs.** `Ecef::new(1.7e308, 1.7e308, 0).to_geodetic()` returned `Ok` with an infinite height. The domain is now capped at 10¹² m (`GeoError::OutsideDomain`).
+  - **P3, case count.** The geodesy properties ran proptest's default 256 cases. They now default to 2048 like the other crates, and `PROPTEST_CASES` still overrides it.
+
+**Dependencies**
+
+- No new external crates. `proptest` (already vetted) is a dev-dependency of `iqsim-geo`. Reference data was generated outside CI in a scratch venv with pyproj 3.8.0 / PROJ 9.8.1 and mpmath 1.4.1; the generator is checked in (`crates/iqsim-geo/tests/data/gen_oracle.py`, provenance in `README.md` there). The Gillham table is checked in unmodified with its archive URL and SHA-256.
+
+**Open questions**
+
+- AGL with a geoid grid but no terrain: should AGL mean "above MSL" (ground at the geoid) until phase 8? Kept as ellipsoidal to avoid reaching ahead.
+- Light time (prompt 9) will call `EarthOrientation::at` at retarded instants; `AcqInstant` arithmetic for `t − τ` with sub-ps τ needs a helper there.
+- Geoid grids are held in memory as u16 (EGM2008 1′ is 466 MB). A memory-mapped or tiled reader could come with terrain (phase 8).

@@ -11,6 +11,8 @@
 //!   rate), attenuation 20 to 200 dB and group delay 0 to 1 ms.
 //! - Clock and LO `fixed_offset` models have an `offset`, and `ideal` ones do not.
 //! - Render duration and block length are positive.
+//! - A `world.geoid` path is not empty, and `world.pressure_offset` is within
+//!   ±200 hPa.
 //! - A receiver has at least one channel.
 //! - An emitter has an `iq_file` table exactly when `waveform = "iq_file"`; its start
 //!   is not negative, its path is not empty, and its source response has
@@ -26,6 +28,9 @@ use iqsim_units::{Frequency, SampleRate};
 use toml::Spanned;
 
 use crate::diagnostic::Diagnostic;
+
+/// Largest |world.pressure_offset|, Pa (`iqsim_geo::atmosphere::MAX_PRESSURE_OFFSET_PA`).
+const MAX_PRESSURE_OFFSET_PA: f64 = 20_000.0;
 use crate::ident::Ident;
 use crate::model::{
     ClockModel, ClockModelSpec, LoModel, LoModelSpec, ResponseDetail, SCENARIO_SCHEMA_VERSION,
@@ -312,6 +317,20 @@ impl Validator {
             self.error(
                 s.metadata.name.span(),
                 "metadata.name cannot be empty".to_owned(),
+            );
+        }
+
+        if let Some(g) = &s.world.geoid
+            && g.path.get_ref().trim().is_empty()
+        {
+            self.error(g.path.span(), "world.geoid.path is empty".to_owned());
+        }
+        if let Some(p) = &s.world.pressure_offset
+            && p.get_ref().pascals().abs() > MAX_PRESSURE_OFFSET_PA
+        {
+            self.error(
+                p.span(),
+                "world.pressure_offset must be within ±200 hPa".to_owned(),
             );
         }
 

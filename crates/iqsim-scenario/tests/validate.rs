@@ -244,3 +244,26 @@ fn examples_lint_clean() {
         assert!(found.is_empty(), "{name}: {:?}", found);
     }
 }
+
+#[test]
+fn world_table() {
+    assert!(
+        errors("[world]\ngeoid = { path = \"egm96-5.pgm\" }\npressure_offset = \"-35.5 hPa\"\n")
+            .is_empty()
+    );
+    assert!(errors("[world]\npressure_offset = \"29.92 inHg\"\n").len() == 1);
+    let e = errors("[world]\ngeoid = { path = \" \" }\npressure_offset = \"201 hPa\"\n");
+    let m: Vec<&str> = e.iter().map(|(_, _, m)| m.as_str()).collect();
+    assert_eq!(
+        m,
+        [
+            "world.geoid.path is empty",
+            "world.pressure_offset must be within ±200 hPa"
+        ]
+    );
+    // Line 8 of the full source is `geoid = …`; the span starts at the path string.
+    assert_eq!((e[0].0, e[0].1), (8, 18));
+    // Units are checked like every other quantity, and unknown fields are rejected.
+    assert!(!errors("[world]\npressure_offset = \"5 hpa\"\n").is_empty());
+    assert!(!errors("[world]\ngeoid_path = \"x\"\n").is_empty());
+}

@@ -208,6 +208,7 @@ dependencies = [
  "iqsim-core",
  "iqsim-units",
  "libm",
+ "proptest",
 ]
 
 [[package]]

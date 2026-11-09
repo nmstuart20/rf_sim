@@ -103,6 +103,9 @@ fn run(mut args: Vec<OsString>) -> ExitCode {
     };
     match iqsim_runtime::run_offline(file.as_ref(), out.as_ref(), options) {
         Ok(m) => {
+            for w in &m.warnings {
+                eprintln!("warning: {w}");
+            }
             for o in &m.outputs {
                 println!(
                     "{}: {} samples, sha256 {}",

@@ -23,6 +23,7 @@
 //! | [`Gain`] | dB, dBi | f64 dB |
 //! | [`Distance`] | m, km, ft, nmi | f64 m |
 //! | [`Speed`] | m/s, km/h, kt | f64 m/s |
+//! | [`Pressure`] | Pa, hPa, mbar, inHg | f64 Pa |
 //! | [`Angle`] | deg, °, rad, DMS | f64 deg |
 //! | [`Altitude`] | m, km, ft, nmi + MSL/AGL/ellipsoid, or FL | f64 m + reference |
 //! | [`Position`] | lat/lon (decimal or DMS) or [`Mgrs`], plus altitude | f64 deg |
@@ -46,6 +47,6 @@ pub mod utm;
 pub use angle::{Angle, Latitude, Longitude};
 pub use error::{QuantityKind, UnitError};
 pub use exact::{DataRate, Duration, Frequency, SampleRate};
-pub use float::{Distance, Gain, Power, Speed};
+pub use float::{Distance, Gain, Power, Pressure, Speed};
 pub use mgrs::{Mgrs, MgrsError, MgrsErrorKind};
 pub use position::{Altitude, AltitudeRef, Position, PositionError};

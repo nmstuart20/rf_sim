@@ -4,7 +4,7 @@
 //! choices that exist today (for example `clock = { model = "ideal" }`); later
 //! prompts add variants and fields without changing the surrounding layout.
 
-use iqsim_units::{DataRate, Duration, Frequency, Gain, Position, Power, SampleRate};
+use iqsim_units::{DataRate, Duration, Frequency, Gain, Position, Power, Pressure, SampleRate};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use toml::Spanned;
@@ -32,6 +32,10 @@ pub struct Scenario {
     pub run_mode: RunMode,
     /// Render settings for `sim run` (duration and block length).
     pub render: Option<Render>,
+    /// Earth model: geoid grid and local atmosphere (MSL heights, flight levels and
+    /// Mode C altitude).
+    #[serde(default)]
+    pub world: World,
     /// Where library items are looked up.
     #[serde(default)]
     pub library: Library,
@@ -87,6 +91,29 @@ pub struct Render {
     /// channel and antenna-port rate.
     #[schemars(with = "Option<Duration>")]
     pub block: Option<Spanned<Duration>>,
+}
+
+/// Earth model settings (contracts §12.5, §12.6).
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct World {
+    /// Geoid grid. Without one, the geoid height is 0 everywhere (MSL is the
+    /// ellipsoid) and the run manifest carries a warning.
+    pub geoid: Option<GeoidSpec>,
+    /// Local sea-level pressure minus 1013.25 hPa (QNH − standard), default 0. Shifts
+    /// pressure altitude (Mode C) and the geometric height of flight levels.
+    #[schemars(with = "Option<Pressure>")]
+    pub pressure_offset: Option<Spanned<Pressure>>,
+}
+
+/// A geoid grid file.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GeoidSpec {
+    /// A GeographicLib PGM geoid grid (e.g. `egm96-5.pgm`), relative to the scenario
+    /// file unless absolute.
+    #[schemars(with = "String")]
+    pub path: Spanned<String>,
 }
 
 /// Details of a pre-sampling tap response (H_rx or B_out), beyond its bandwidth.

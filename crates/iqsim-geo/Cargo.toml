@@ -11,5 +11,8 @@ iqsim-core.workspace = true
 iqsim-units.workspace = true
 libm.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

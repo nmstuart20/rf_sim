@@ -26,7 +26,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Manifest format version this build writes and reads.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Writes `value` as iqsim canonical JSON v1 (see the module docs).
 pub fn canonical_json(value: &Value) -> Vec<u8> {
@@ -447,6 +447,9 @@ pub struct RunManifest {
     pub duration_ps: i64,
     /// External inputs, in (kind, name) order.
     pub assets: Vec<AssetRecord>,
+    /// Resolution warnings (deterministic: they follow from the resolved scenario),
+    /// e.g. that no geoid grid was configured. Since schema version 2.
+    pub warnings: Vec<String>,
     /// Event log, when the run had live commands.
     pub event_log: Option<EventLogRecord>,
     /// Output streams, in stream order.

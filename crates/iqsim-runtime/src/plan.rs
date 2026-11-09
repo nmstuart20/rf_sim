@@ -4,10 +4,16 @@
 //!
 //! What a v1 offline run supports, and how each scenario item maps:
 //!
-//! - Platforms are static. A position becomes WGS84 ECEF. MSL and AGL heights are
-//!   taken as heights above the ellipsoid, because there is no geoid or terrain model
-//!   yet (phases 3 and 8). Flight levels are rejected until the Mode C altitude chain.
-//!   Mounts are ignored: antennas are isotropic at the platform origin.
+//! - Platforms are static. A position becomes WGS84 ECEF. An MSL height adds the
+//!   geoid height N(φ, λ) from `[world] geoid` (N = 0 without a grid, with a manifest
+//!   warning). A flight level is a pressure altitude: it goes through the inverse ISA
+//!   chain with `[world] pressure_offset`, then the geoid (contracts §12.6). AGL
+//!   heights are still taken as heights above the ellipsoid, because there is no
+//!   terrain model yet (phase 8). Mounts are ignored: antennas are isotropic at the
+//!   platform origin.
+//! - A geoid grid is read once here; its file SHA-256, length and header values go
+//!   into the resolved scenario (so a changed grid changes the resolved hash) and the
+//!   manifest registers it as a `geoid_grid` asset.
 //! - Emitters must use `behavior = "always_on"` and the built-in `waveform = "cw"` or
 //!   `waveform = "iq_file"`. Library resolution comes later.
 //! - An `iq_file` path is relative to the scenario file. Resolution opens the recording
@@ -32,7 +38,7 @@ use iqsim_core::{
     ChannelTimebase, IdealClockMap, MAX_BLOCK_LEN, ResponseSpec, SampleRate, TapKind, TapResponse,
     TargetScale, TruthTime,
 };
-use iqsim_geo::Ecef;
+use iqsim_geo::{AltitudeModel, Atmosphere, Ecef, Geoid, GeoidGrid};
 use iqsim_io::iq_input::IqInput;
 use iqsim_receiver::{
     AdcConfig, AgcConfig, ChainConfig, DecimationConfig, FrontEnd, IqImpairment, LoConfig,
@@ -374,6 +380,56 @@ pub struct ResolvedStream {
     pub sinks: Vec<String>,
 }
 
+/// The resolved geoid model.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "model", rename_all = "snake_case")]
+pub enum ResolvedGeoid {
+    /// No grid configured: N = 0 (MSL is the ellipsoid). The manifest carries
+    /// [`ZERO_GEOID_WARNING`].
+    Zero,
+    /// A GeographicLib PGM grid.
+    Grid {
+        /// Absolute path it was read from.
+        path: String,
+        /// File length, bytes.
+        byte_len: u64,
+        /// File SHA-256, hex.
+        sha256: String,
+        /// Columns.
+        width: usize,
+        /// Rows.
+        height: usize,
+        /// Header `Offset`, m.
+        offset_m: f64,
+        /// Header `Scale`, m per count.
+        scale_m: f64,
+        /// Interpolation (`bilinear`).
+        interpolation: String,
+    },
+}
+
+/// The resolved Earth model.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResolvedWorld {
+    /// Geoid.
+    pub geoid: ResolvedGeoid,
+    /// Sea-level pressure offset from 1013.25 hPa, Pa.
+    pub pressure_offset_pa: f64,
+}
+
+/// The run-manifest warning when no geoid grid is configured.
+pub const ZERO_GEOID_WARNING: &str =
+    "no geoid grid configured: geoid height is 0 everywhere (MSL heights are ellipsoid heights)";
+
+/// Warnings a run with this resolved scenario records in its manifest.
+pub fn resolution_warnings(resolved: &ResolvedScenario) -> Vec<String> {
+    let mut w = Vec::new();
+    if resolved.world.geoid == ResolvedGeoid::Zero {
+        w.push(ZERO_GEOID_WARNING.to_owned());
+    }
+    w
+}
+
 /// A scenario with every default filled in. Its canonical JSON hash identifies the run
 /// configuration in the manifest.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -392,6 +448,8 @@ pub struct ResolvedScenario {
     pub duration_ps: i64,
     /// Block length, ps.
     pub block_ps: i64,
+    /// Earth model.
+    pub world: ResolvedWorld,
     /// Emitters, in file order.
     pub emitters: Vec<ResolvedEmitter>,
     /// Streams: receiver channels in file order, then antenna ports.
@@ -407,21 +465,24 @@ pub fn entity_id(name: &str) -> u32 {
     u32::from_le_bytes([d[0], d[1], d[2], d[3]])
 }
 
-fn ecef(position: &Position, what: &str) -> Result<[f64; 3], ResolveError> {
+fn ecef(position: &Position, model: &AltitudeModel, what: &str) -> Result<[f64; 3], ResolveError> {
     let alt = position.altitude();
-    match alt.reference() {
-        AltitudeRef::PressureStd => {
-            return err(format!(
-                "{what}: flight levels need the Mode C altitude model, which is not available yet"
-            ));
-        }
-        AltitudeRef::Ellipsoid | AltitudeRef::Msl | AltitudeRef::Agl => {}
-    }
-    let e = Ecef::from_geodetic(
+    let (lat, lon) = (
         position.latitude().degrees(),
         position.longitude().degrees(),
-        alt.meters(),
     );
+    let (lat_rad, lon_rad) = (lat.to_radians(), lon.to_radians());
+    let geo = |e: iqsim_geo::GeoError| ResolveError(format!("{what}: {e}"));
+    let h = match alt.reference() {
+        AltitudeRef::Ellipsoid | AltitudeRef::Agl => alt.meters(),
+        AltitudeRef::Msl => model
+            .ellipsoid_height_from_msl_m(lat_rad, lon_rad, alt.meters())
+            .map_err(geo)?,
+        AltitudeRef::PressureStd => model
+            .ellipsoid_height_from_pressure_altitude_m(lat_rad, lon_rad, alt.meters())
+            .map_err(geo)?,
+    };
+    let e = Ecef::from_geodetic(lat, lon, h);
     Ok([e.x, e.y, e.z])
 }
 
@@ -511,6 +572,7 @@ fn format_of(
 
 fn platform_position(
     scenario: &Scenario,
+    model: &AltitudeModel,
     name: &str,
     owner: &str,
 ) -> Result<[f64; 3], ResolveError> {
@@ -519,7 +581,7 @@ fn platform_position(
         .iter()
         .find(|p| p.name.as_str() == name)
         .ok_or_else(|| ResolveError(format!("{owner}: unknown platform \"{name}\"")))?;
-    ecef(&p.position, owner)
+    ecef(&p.position, model, owner)
 }
 
 /// Resolves a parsed, lint-clean scenario. Relative input paths are taken from
@@ -536,6 +598,7 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
     if duration_ps <= 0 || block_ps <= 0 {
         return err("render duration and block must be positive");
     }
+    let (world, model) = resolve_world(scenario, base)?;
 
     let mut emitters = Vec::new();
     for e in &scenario.emitters {
@@ -557,7 +620,7 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
         };
         emitters.push(ResolvedEmitter {
             name: e.name.as_str().to_owned(),
-            position_ecef_m: platform_position(scenario, e.platform.as_str(), &owner)?,
+            position_ecef_m: platform_position(scenario, &model, e.platform.as_str(), &owner)?,
             carrier_uhz: e.frequency.get_ref().as_micro_hz(),
             power_w: e.power.watts(),
             waveform: waveform.to_owned(),
@@ -578,6 +641,7 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
         ids.push((id, r.name.as_str().to_owned()));
         let position = platform_position(
             scenario,
+            &model,
             r.platform.as_str(),
             &format!("receiver \"{}\"", r.name.as_str()),
         )?;
@@ -699,7 +763,7 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
             a.name.as_str(),
             0,
             0,
-            platform_position(scenario, a.platform.as_str(), &owner)?,
+            platform_position(scenario, &model, a.platform.as_str(), &owner)?,
             a.center_frequency.get_ref().as_micro_hz(),
             rate,
             block_ps,
@@ -713,16 +777,71 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
         )?);
     }
     Ok(ResolvedScenario {
-        resolver_version: 1,
+        resolver_version: RESOLVER_VERSION,
         name: scenario.metadata.name.get_ref().clone(),
         epoch_unix_seconds: scenario.epoch.unix_seconds(),
         epoch_nanos: scenario.epoch.nanosecond(),
         seed: scenario.seed,
         duration_ps,
         block_ps,
+        world,
         emitters,
         streams,
     })
+}
+
+/// Resolution rules version (2 since prompt 7: the Earth model).
+pub const RESOLVER_VERSION: u32 = 2;
+
+/// Reads the geoid grid (if any) and builds the altitude model.
+fn resolve_world(
+    scenario: &Scenario,
+    base: &Path,
+) -> Result<(ResolvedWorld, AltitudeModel), ResolveError> {
+    let pressure_offset_pa = scenario
+        .world
+        .pressure_offset
+        .as_ref()
+        .map_or(0.0, |p| p.get_ref().pascals());
+    let atmosphere = Atmosphere::new(pressure_offset_pa)
+        .map_err(|e| ResolveError(format!("world.pressure_offset: {e}")))?;
+    let (geoid, resolved) = match &scenario.world.geoid {
+        None => (Geoid::Zero, ResolvedGeoid::Zero),
+        Some(g) => {
+            let rel = Path::new(g.path.get_ref());
+            let path = if rel.is_absolute() {
+                rel.to_path_buf()
+            } else {
+                base.join(rel)
+            };
+            let bytes = std::fs::read(&path)
+                .map_err(|e| ResolveError(format!("world.geoid: {}: {e}", path.display())))?;
+            let grid = GeoidGrid::from_pgm_bytes(&bytes)
+                .map_err(|e| ResolveError(format!("world.geoid: {}: {e}", path.display())))?;
+            let m = grid.metadata();
+            let resolved = ResolvedGeoid::Grid {
+                path: std::path::absolute(&path)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string(),
+                byte_len: bytes.len() as u64,
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                width: m.width,
+                height: m.height,
+                offset_m: m.offset_m,
+                scale_m: m.scale_m,
+                interpolation: m.interpolation.to_owned(),
+            };
+            (Geoid::Grid(grid), resolved)
+        }
+    };
+    Ok((
+        ResolvedWorld {
+            geoid: resolved,
+            pressure_offset_pa,
+        },
+        AltitudeModel::new(geoid, atmosphere),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
