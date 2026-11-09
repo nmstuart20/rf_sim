@@ -157,3 +157,59 @@ Append one entry per prompt. Newest at the bottom. Each entry covers what was bu
   - The quantization bound was stated as "within 1.5 LSB". The exact worst case at `MAX_BLOCK_LEN` is 1.5 + 2⁻²¹ LSB, so the bound now reads < 2 LSB: 4.7·10⁻¹⁰ samples of delay and 6.9·10⁻¹⁹ rad of phase. Both are still negligible against the budgets.
   - A true delay just inside −2³¹ samples could be pushed past the range edge by quantization and wrap to nearly `i64::MAX`. I added `DELAY_RANGE_MARGIN_LSB = 2`. Contracts §1.3 now requires the geometry fitter to keep the true delay that far inside the Q32.32 range.
 - A second, narrower run at `high` reasoning covered `fixed.rs` and `trig.rs`. It found no implementation bugs (ties, range checks, wrapping, signed zero, table construction, CUDA/FMA portability). It found one wrong comment: a power-of-two-scaled product *can* be subnormal (2⁻¹⁰⁷⁴·2³²). The scaling is still exact, so only the wording changed.
+
+---
+
+## Prompt 3: Philox and Gaussian noise (2026-11-08)
+
+**Built** (all in `iqsim-core`, written so the CUDA backend can port it line by line)
+
+- `philox`:
+  - `philox4x32_10(ctr, key)`: Philox4x32-10 exactly as in Random123 (Salmon et al., SC'11). Passes all six philox4x32 known-answer vectors (three 7-round, three 10-round) from Random123's `tests/kat_vectors`. The vectors are checked in verbatim at `crates/iqsim-core/tests/data/random123_kat_philox4x32.txt`, with the upstream commit (`9545ff6`), the SHA-256 of the full file and the BSD-3 notice. A private round-count parameter exists only so the 7-round vectors can test the round structure.
+  - `stream_key(seed, entity, stream)`: `k = mix(mix(seed ⊕ KEY_DOMAIN) ⊕ (entity << 32 | stream))`, where `mix64` is the SplitMix64 finalizer. Because `mix64` is a bijection, the key is injective in (entity, stream) for a fixed seed.
+  - `PhiloxStream::block(index, sub_index)`: counter `(index_lo, index_hi, sub_lo, sub_hi)`.
+  - Stream-id registry: `StreamKind` (u16 codes, append-only, 0 reserved) and `StreamId = kind << 16 | instance`, which can only be built from a registered kind. The only kind so far is `ReceiverThermalNoise` (code 1, instance = channel).
+- `log`: `ln(f32) -> Result<f32, NumericError>`, the fdlibm decomposition with Taylor coefficients and a 12-bit/f32 split of ln 2. It uses integer range reduction and handles subnormals. There are no std or libm calls, and every operation is explicit. **Measured error ≤ 0.86 ulp**. On the Box-Muller range [2⁻⁶⁵, 1] the absolute error is ≤ 1.932·10⁻⁶ (asserted ≤ 2·10⁻⁶).
+- `noise`: `noise(seed, entity, stream, SampleIndex) -> (f32, f32)` and `NoiseStream::sample` (the key is mixed once per stream). Box-Muller over one Philox block per sample, with **unit complex power** (`E[I²] = E[Q²] = ½`, `E|z|² = 1`):
+  - The radius uniform is built exactly from 64 bits (truncated to 24 significant bits, x = 0 → 2⁻⁶⁵).
+  - `r = sqrt(−ln u)`, so `r ≤ 6.71`.
+  - The angle is word 2 as a u32 phase into `sincos`. Word 3 is unused.
+- Tests: 11 new unit tests, 8 property tests (`tests/noise_props.rs`), 2 statistics tests (`tests/noise_stats.rs`) and 2 goldens (`tests/noise_golden.rs`).
+  - Known-answer vectors; the counter layout; the key-mix definition; the published SplitMix64 first output; registry round trip.
+  - ln: the split constants (e·LN2_HI exact for every exponent), the rejected inputs, every power of two, an exhaustive sweep of 13 binades plus subnormals, ≤ 1 ulp over random positive finite f32, and monotonicity (exhaustive over [0.5, 2), random elsewhere).
+  - Radius uniform: equals the exact truncated value, is monotone, and stays in (0, 1). Noise is finite and within the radius bound at random inputs. The free function matches the stream form and the raw block function.
+  - Key mix: an explicit inverse of `mix64` round-trips, and unmixing a key recovers (entity, stream).
+  - Statistics, with thresholds fixed in advance (6 standard errors; Anderson-Darling 1 % value 3.857). Over 10⁷ samples:
+    - E|z|² = 0.999931 and E[IQ] = 1.4·10⁻⁴
+    - I: variance 0.499866, skewness 1.96·10⁻³, excess kurtosis −1.3·10⁻⁴
+    - Q: variance 0.500064, skewness −6.8·10⁻⁴, excess kurtosis 1.05·10⁻³
+    - A²: I 1.153, Q 0.282, |z|² vs Exp(1) 0.390
+  - Cross-correlation over 10⁶ samples (complex, lags −2..2, plus power correlation) for adjacent channels, entities and seeds, and for the same stream at lags 1..5. The largest |ρ| was 1.7·10⁻³ against a bound of 4.2·10⁻³.
+  - Goldens `core/noise_1e6` (500 000 consecutive samples across the 2³² counter-word boundary plus 500 000 random tuples) and `core/ln_1e6`. Both are blessed for the first time; no existing golden changed.
+
+**Contracts changed** (`docs/contracts.md`, still version 0: §10 decisions 9 and 10 remain)
+
+- §10 decision 8 settled. §1.5 now pins the ln algorithm and error, the Philox constants and known answers, the key mix, the counter layout, the stream-id registry table and the noise transform and variance. §5's noise bullet names the registry constructor.
+
+**Deviations**
+
+- The prompt says counter = (sample index, sub-index). The sub-index is a full u64 in counter words 2–3, so no counter word is left reserved.
+- The output is unit *complex* power (each component variance ½), not unit variance per component. A noise power P then scales by √(P·R₀) directly, matching §2's RMS convention. Box-Muller therefore uses `sqrt(−ln u)` instead of `sqrt(−2 ln u)`.
+- The radius uniform takes 64 bits (two words), not 32, so the tail reaches 9.5 σ per component instead of 6.7 σ. That costs one Philox block per complex sample, with one word unused. If noise generation turns out to limit CPU real-time margin (plan, phase 5), a two-samples-per-block layout is the fallback, and it would be a contract change.
+- `ln` returns `Result` at the public boundary (zero, negative and non-finite inputs are errors, §1.4). Noise uses an unchecked internal form whose input is positive by construction.
+- `noise_stats` takes about 23 s in the debug test profile (10⁷ samples plus three sorts and Anderson-Darling). It is not `#[ignore]`d, because the prompt makes it part of the required tests.
+
+**Dependencies**
+
+- `libm` 0.2.16, MIT, **dev-dependency of `iqsim-core` only**, declared in `[workspace.dependencies]`. It provides `erfc`, `expm1` and `log` in f64 for the Anderson-Darling reference CDFs. The normal tails need an accurate erfc, which std lacks, and writing one in-house for a test oracle is not worth it. It has no dependencies. Its `build.rs` only emits cfg flags and never touches the network. It is already the project's planned control-plane math crate (AGENTS.md), so later prompts can promote it to a normal dependency without new vetting. Simulation code does not use it here.
+
+**Open questions**
+
+- The registry has one kind. Later prompts append theirs (SSR PRF jitter in prompt 12, the clock/GPSDO and phase-noise processes in prompt 15) and document their entity and sub-index use in the §1.5 table.
+- Entity ids are raw u32 for now. The scenario resolver (phase 3+) must assign them deterministically, because the key depends on them.
+
+**Independent review (Codex CLI, `high` reasoning)**
+
+- It confirmed that Philox matches Random123's `philox.h` (round function, word order, key bumps) and found no correctness bugs in key mixing, ln, the radius uniform, Box-Muller or CUDA portability. It raised two minor issues, both fixed:
+  - The ln absolute-error figure was rounded down: the worst case is 1.9313·10⁻⁶ at `0x1FB2E007`. The docs now say ≤ 1.932·10⁻⁶ (asserted ≤ 2·10⁻⁶).
+  - The lagged cross-correlation normalized by n while summing n − 2 products, which attenuated ρ slightly. It now divides by the true product count.

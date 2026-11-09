@@ -22,6 +22,15 @@
 //! - [`sincos`] over [`SIN_TABLE`].
 //! - [`OffsetFrequency::phase_at`]: carrier-offset phase from exact time.
 //!
+//! Prompt 3 added randomness. Every random draw in the simulator comes from here:
+//!
+//! - [`philox4x32_10`]: the Philox4x32-10 block function (Random123 known answers).
+//! - [`StreamId`] (the stream-id registry, [`StreamKind`]) and [`stream_key`]: the key
+//!   for (scenario seed, entity id, stream id). [`PhiloxStream`] adds the
+//!   (sample index, sub-index) counter.
+//! - [`ln`]: a deterministic f32 natural logarithm.
+//! - [`noise`] and [`NoiseStream`]: unit-power complex Gaussian noise by Box-Muller.
+//!
 //! See `docs/contracts.md` §1, §3 and §10 for the contracts these types implement.
 //!
 //! Dependencies: no iqsim crates.
@@ -32,7 +41,10 @@ mod block;
 mod clock;
 mod error;
 mod fixed;
+mod log;
+mod noise;
 mod offset;
+mod philox;
 mod poly;
 mod rate;
 mod time;
@@ -50,7 +62,12 @@ pub use fixed::{
     DELAY_FRAC_BITS, Delay, POLY_EXTRA_BITS, Phase, f32_to_i64_ties_even, f64_to_i64_ties_even,
     require_finite_f32, require_finite_f64,
 };
+pub use log::ln;
+pub use noise::{NOISE_SUB_INDEX, NoiseStream, noise};
 pub use offset::OffsetFrequency;
+pub use philox::{
+    KEY_DOMAIN, PhiloxStream, StreamId, StreamKind, mix64, philox4x32_10, stream_key,
+};
 pub use poly::{
     BlockPoly, DELAY_RANGE_MARGIN_LSB, DelayPoly, MAX_BLOCK_LEN, PhasePoly, PolyCursor, PolyOutput,
     binomials,

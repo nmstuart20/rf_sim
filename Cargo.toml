@@ -32,6 +32,7 @@ iqsim-cli = { path = "crates/iqsim-cli" }
 xtask = { path = "xtask" }
 sha2 = "0.10.9"
 hex = "0.4.3"
+libm = "0.2.16"
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]

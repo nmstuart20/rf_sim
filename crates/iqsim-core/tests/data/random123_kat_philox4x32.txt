@@ -1,0 +1,17 @@
+# Philox4x32 known-answer vectors, copied verbatim from the Random123 distribution.
+#
+# Source:  https://github.com/DEShawResearch/random123, file tests/kat_vectors
+# Commit:  9545ff6413f258be2f04c1d319d99aaef7521150 (main, retrieved 2026-11-08)
+# SHA-256 of the full upstream file:
+#          aab5ebabf40003f63d6d87b24cbd2c8a02652e00cf8bad64226fd50586929183
+# License: Random123 is distributed under the BSD 3-clause license
+#          (Copyright 2010-2012, D. E. Shaw Research).
+#
+# Only the column header and the philox4x32 lines are kept. Columns:
+#nameNxW  R  CTR                                 KEY                                   EXPECTED
+philox4x32 7 00000000 00000000 00000000 00000000 00000000 00000000   5f6fb709 0d893f64 4f121f81 4f730a48
+philox4x32 7 ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff   5207ddc2 45165e59 4d8ee751 8c52f662
+philox4x32 7 243f6a88 85a308d3 13198a2e 03707344 a4093822 299f31d0   4dfccaba 190a87f0 c47362ba b6b5242a
+philox4x32 10 00000000 00000000 00000000 00000000 00000000 00000000   6627e8d5 e169c58d bc57ac4c 9b00dbd8
+philox4x32 10 ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff   408f276d 41c83b0e a20bc7c6 6d5451fd
+philox4x32 10 243f6a88 85a308d3 13198a2e 03707344 a4093822 299f31d0   d16cfe09 94fdcceb 5001e420 24126ea1

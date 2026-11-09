@@ -98,8 +98,34 @@ Floating point is allowed only where its rounding is fixed by construction.
   - Table construction runs at compile time and uses only integers, no float library. sin((π/2)·j/256) for j = 0..256 comes from an integer Taylor series in Q2.62 starting at ⌊(π/2)·2⁶²⌋ = `0x6487ED5110B4611A`. Each value is rounded to f32 ties-to-even by bit manipulation, and quarter-wave symmetry fills the table, with zero always +0.0. A test checks that every entry is correctly rounded and that none is within 2⁸ Q2.62 units of a rounding tie.
   - Measured max absolute error over all 2²⁴ values of the top 24 bits, with random low bits: 5.98·10⁻⁸ (sin) and 5.97·10⁻⁸ (cos), about 1 ulp. The target is ≤ 3·10⁻⁷.
   - Golden hashes: the table bytes (`core/sincos_table`) and 10⁶ evaluations (`core/sincos_1e6`).
-- `ln` for Box-Muller: in-house range reduction plus a fixed polynomial, with no std or libm call, so the GPU port matches. Its error is documented in prompt 3.
-- Noise: Philox4x32-10. Key = deterministic mix of (scenario seed: u64, entity id: u32, stream id: u32). Counter = (sample index, sub-index). The Gaussian draw is Box-Muller, with the angle passed as a u32 phase to `sincos`. Stream ids are allocated in a single registry in iqsim-core, so two models never share a stream.
+- `ln(x: f32) -> Result<f32, NumericError>` (settled, prompt 3). It uses no std or libm call, so the GPU port matches. The full method is in `iqsim-core/src/log.rs`.
+  - Range reduction on the bit pattern, with integer operations only. A subnormal is first scaled by 2²³ (exact). `x = 2ᵉ·m`, and m is halved when its bit pattern is above `0x3FB504F3`, so m ∈ [0.7071068, 1.4142135].
+  - `f = m − 1` (exact), `s = f/(2 + f)`, `z = s²`, `hfsq = 0.5·f²`, `R = z·(2/3 + z·(2/5 + z·(2/7 + z·2/9)))` (Taylor coefficients rounded to f32, Horner form, every operation separate).
+  - `ln x = e·LN2_HI − ((hfsq − (s·(hfsq + R) + e·LN2_LO)) − f)`. `LN2_HI` is ln 2 rounded to f32 with the low 12 mantissa bits cleared, so `e·LN2_HI` is exact for every exponent. `LN2_LO = (ln 2 − LN2_HI)` rounded to f32.
+  - Error, measured against an f64 reference over every f32 in 13 binades plus a sample of subnormals: **≤ 0.86 ulp** (asserted ≤ 1 ulp, and ≤ 1 ulp in a property test over random positive finite f32). On [2⁻⁶⁵, 1], the Box-Muller range, the absolute error is ≤ 1.932·10⁻⁶, asserted ≤ 2·10⁻⁶ (half an ulp of |ln 2⁻⁶⁵| ≈ 45). `ln(1) = +0`. Zero, negative and non-finite inputs are errors.
+  - Golden: 10⁶ evaluations (`core/ln_1e6`).
+- **Philox (settled, prompt 3).** Philox4x32-10 exactly as in Random123 (`iqsim-core/src/philox.rs`): multipliers `0xD2511F53`, `0xCD9E8D57`, Weyl key bumps `0x9E3779B9`, `0xBB67AE85`, ten rounds and nine bumps. It passes the six philox4x32 known-answer vectors (7 and 10 rounds) of Random123's `tests/kat_vectors`, which are checked in verbatim with their provenance. The 32 × 32 → 64-bit products are plain u64 multiplies (CUDA: `__umulhi` and `*`).
+- **Stream key (settled, prompt 3).** `mix(z)` is the SplitMix64 finalizer (`z ^= z>>30; z *= 0xBF58476D1CE4E5B9; z ^= z>>27; z *= 0x94D049BB133111EB; z ^= z>>31`, mod 2⁶⁴), a bijection on u64. With `KEY_DOMAIN = 0x697173696D2D7031` (ASCII `iqsim-p1`):
+  - `k = mix(mix(seed ⊕ KEY_DOMAIN) ⊕ (entity << 32 | stream))`, and the key is `(k mod 2³², k >> 32)`.
+  - For a fixed seed the map (entity, stream) → key is injective, so no two streams of one scenario share a key. A property test checks this through an explicit inverse of `mix`.
+- **Counter (settled, prompt 3).** `(c0, c1, c2, c3) = (index_lo, index_hi, sub_lo, sub_hi)`: the u64 sample index at the rate where the draw happens, then a u64 sub-index. Each model documents which sub-indices it uses.
+- **Stream-id registry (settled, prompt 3).** `StreamId = kind << 16 | instance`, where `StreamKind` is a u16 code. `StreamId` can only be built from a registered kind, so two models never share a stream. Codes are part of this contract: new kinds are appended, and no code is ever renumbered or reused, because that would change output bits. Code 0 is reserved. Registered so far:
+
+  | Code | Kind | Instance | Entity | Sub-indices |
+  | --- | --- | --- | --- | --- |
+  | 1 | `ReceiverThermalNoise` | channel index | receiver | 0 (`NOISE_SUB_INDEX`) |
+
+- **Gaussian noise (settled, prompt 3).** `noise(seed, entity, stream, n) -> (f32, f32)` (or `NoiseStream::sample`) is circularly symmetric complex Gaussian with **unit complex power**: `E[I²] = E[Q²] = ½`, `E[I·Q] = 0`, `E|z|² = 1`. Scale it by the RMS voltage of the wanted noise power (§2). Sample n uses one block at counter (n, 0):
+  1. `x = w1·2³² + w0`. The radius uniform `u` is `x·2⁻⁶⁴` truncated to 24 significant bits, built as f32 from the bit pattern (leading-zero count, shift, exponent field). `x = 0` gives `u = 2⁻⁶⁵`. So `u ∈ [2⁻⁶⁵, 1 − 2⁻²⁴]`.
+  2. `r = sqrt(−ln u)` (IEEE sqrt). `r ≤ sqrt(65·ln 2) ≈ 6.71`, about 9.5 σ per component.
+  3. `(s, c) = sincos(Phase(w2 << 32))`: the angle is w2 as a u32 phase.
+  4. Output `(r·c, r·s)`. Word w3 is unused.
+
+  Quantization of u and θ and the ln and sincos errors bias the variance by under 10⁻⁶ relative. Tests over fixed seeds:
+  - 10⁷ samples: means, variances, I/Q correlation, skewness and excess kurtosis all within 6 standard errors.
+  - Anderson-Darling A² against the 1 % critical value 3.857: I 1.153, Q 0.282 (scaled to N(0, 1)) and |z|² 0.390 (against Exp(1)).
+  - Complex cross-correlation at lags −2..2, and power correlation, for adjacent channels, entities and seeds, and for the same stream at lags 1..5. All are within 6 standard errors over 10⁶ samples.
+  - Golden: 10⁶ samples (`core/noise_1e6`).
 
 ### 1.6 Carrier-offset phase
 
@@ -223,7 +249,7 @@ Every receiver channel has two taps.
 - **Response application.** Narrowband emitters: the response at the emitter offset folds into the amplitude and phase polynomials, and paths below the in-band threshold are culled. Analytic pulses: complex band-limited edge tables (edge ⊛ response, shifted to the offset), built deterministically before their effective boundary. Wideband emitters: filtered inside the resampler before the fractional delay.
 - **Stateless kernels.** Render kernels see only the work list and immutable tables. They own no state across blocks.
 - **Stateful processes.** Decimation filter history, AGC, phase noise, clock processes and resampler source history live in one owner per channel (`ReceiverChannelState`, or the waveform source on the control plane). They are handed off in block order: block b+1 starts from the state after block b. Parallel or multi-GPU rendering never resets or duplicates that state. Finalization of a channel happens on exactly one owner.
-- **Noise.** Thermal noise is added once, after the complete path sum. Its Philox stream is keyed by (seed, receiver entity, channel noise stream), with counter = sample index at the rate where noise is injected.
+- **Noise.** Thermal noise is added once, after the complete path sum. Its Philox stream is keyed by (seed, receiver entity, `StreamId::receiver_thermal_noise(channel)`), with counter = sample index at the rate where noise is injected (§1.5).
 - **Truth.** Truth and consumer-knowledge exports leave from the control plane. They never enter IQ samples, IQ headers or context packets.
 
 ## 6. Run manifest and replay
@@ -357,7 +383,7 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 5. **Settled (prompt 2).** Subnormals are preserved on both backends (CPU default, CUDA `-ftz=false`) (§1.4).
 6. **Settled (prompt 2).** `OffsetFrequency` is an i64 in 2⁻³² Hz, with exact floor-mod phase from Q64.64 time (§1.6).
 7. **Settled (prompt 2).** R₀ = 50 Ω RMS, S = 40, headroom limit L = 2⁶², null floor V_ref·10⁻² with V_ref defined per link and block, and below-floor absolute bound 10⁻⁵·V_ref (§2).
-8. Philox key-mixing function and stream-id registry (prompt 3).
+8. **Settled (prompt 3).** Philox4x32-10 with the SplitMix64-finalizer key mix (injective within a seed), counter (sample index, sub-index), the `StreamKind` registry, the in-house f32 `ln` and the unit-power Box-Muller noise (§1.5).
 9. Event-time grid for rounding C, and command vs entity-event ordering at equal times (before phase 4–5).
 10. Error-budget sampling and refinement policy, including derivative bounds vs adaptive refinement and maximum depth (before phase 3).
 
