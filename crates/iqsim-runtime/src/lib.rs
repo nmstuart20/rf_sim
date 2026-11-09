@@ -7,3 +7,5 @@
 //! Dependencies: iqsim-core, iqsim-units, iqsim-contracts, iqsim-scenario, iqsim-geo, iqsim-antenna, iqsim-terrain, iqsim-behavior, iqsim-waveform, iqsim-worklist, iqsim-render, iqsim-receiver, iqsim-io.
 
 #![forbid(unsafe_code)]
+
+pub mod static_scene;

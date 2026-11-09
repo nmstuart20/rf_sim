@@ -31,12 +31,20 @@
 //! - [`ln`]: a deterministic f32 natural logarithm.
 //! - [`noise`] and [`NoiseStream`]: unit-power complex Gaussian noise by Box-Muller.
 //!
-//! See `docs/contracts.md` §1, §3 and §10 for the contracts these types implement.
+//! Prompt 5 added the control-plane definitions every render target shares:
+//!
+//! - [`amplitude`]: 50 Ω RMS normalization, the per-target accumulator scale
+//!   ([`TargetScale`]), the headroom proof ([`Headroom`]) and the lossless cull rule.
+//! - [`response`]: pre-sampling tap responses H_rx / B_out ([`TapResponse`]) and their
+//!   content identity ([`TapResponseId`]).
+//!
+//! See `docs/contracts.md` §1, §2, §3, §5 and §10 for the contracts these types implement.
 //!
 //! Dependencies: no iqsim crates.
 
 #![forbid(unsafe_code)]
 
+pub mod amplitude;
 mod block;
 mod clock;
 mod error;
@@ -47,11 +55,13 @@ mod offset;
 mod philox;
 mod poly;
 mod rate;
+pub mod response;
 mod time;
 mod timebase;
 mod trig;
 pub mod wide;
 
+pub use amplitude::{AmplitudeError, Headroom, TargetScale};
 pub use block::{Block, BlockSpec, Blocks};
 pub use clock::{
     AcqInstant, ClockMap, ClockMapId, IdealClockMap, IdealTimestampClock, ReportedTime,
@@ -73,6 +83,7 @@ pub use poly::{
     binomials,
 };
 pub use rate::{MAX_RATE_DEN, MAX_RATE_HZ, MAX_RATE_NUM, SampleRate};
+pub use response::{ResponseError, ResponseSpec, TapKind, TapResponse, TapResponseId};
 pub use time::{
     PS_PER_MICROSECOND, PS_PER_MILLISECOND, PS_PER_NANOSECOND, PS_PER_SECOND, TruthDuration,
     TruthTime,

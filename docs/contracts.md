@@ -134,7 +134,7 @@ Offset phase `φ(t) = frac(Δf · t)` comes from exact time with modular arithme
 
 **Settled (prompt 2).**
 
-- Δf is `OffsetFrequency`, an i64 in units of 2⁻³² Hz: range ±2³¹ Hz, resolution 2.3·10⁻¹⁰ Hz. It is built from whole Hz (exact) or from f64 Hz (ties-to-even, range-checked).
+- Δf is `OffsetFrequency`, an i64 in units of 2⁻³² Hz: range ±2³¹ Hz, resolution 2.3·10⁻¹⁰ Hz. It is built from whole Hz (exact), from integer µHz (`from_uhz`: `uhz·2³²/10⁶` rounded ties-to-even in integers, the required path for scenario frequencies, prompt 5), or from f64 Hz (ties-to-even, range-checked). Going µHz → f64 Hz → `OffsetFrequency` adds a rounding that can reach 0.04 rad over 100 days at 7 MHz, so the f64 path is only for values that are already f64.
 - t is the Q64.64 ps `AcqInstant` T. The result is `φ = ⌊F·T / (2⁴⁴·5¹²)⌋ mod 2⁶⁴`, in units of 2⁻⁶⁴ cycle, floored toward −∞. It is exact for every i64 frequency and every instant, with error in [0, 1) unit.
 - `OffsetFrequency::phase_at` uses 64-bit primitives only, so the CUDA port can mirror it:
   1. a 192-bit product |F|·|T|
@@ -158,6 +158,14 @@ Offset phase `φ(t) = frac(Δf · t)` comes from exact time with modular arithme
 - LSB voltage `q = V_fs / 2^S`, with S = 40 (settled, prompt 2). One LSB is −240 dBFS, so the f32 contribution's 24-bit precision, not the integer grid, limits small signals.
 
 Contribution component value = `round_ties_even(component_volts / q)` as i64 (`f32_to_i64_ties_even` after the f32 scaling, §1.4). The antenna-port scale is independent of any virtual ADC full scale.
+
+**Scale factor (settled, prompt 5).** `TargetScale::new(V_fs)` computes `lsb_per_volt = f32(2⁴⁰ / V_fs)` (one f64 division, one rounding to f32) and requires it to be a normal f32. **The f32 factor defines the scale**: q is exactly `1 / lsb_per_volt`, and every backend multiplies by that same f32. Each target (antenna port, virtual receiver) declares its own V_fs. Implementation: `iqsim_core::amplitude`.
+
+**Supported peak overlap (settled, prompt 5).** `FULL_SCALE_PATHS = 2⁶² / 2⁴⁰ = 2²²` simultaneous full-scale contributions per sample. A path's bound is `max|a_p|·max|s_p|·lsb_per_volt`:
+- `max|a_p|`: Σ|c_j| of the f32 amplitude cubic in x ∈ [0, 1], widened by 2⁻²⁰ relative for the f32 Horner evaluation.
+- `max|s_p|`: taken as at least 1, so the proof also bounds the kernel's intermediate `m = a·lsb_per_volt` (a tiny pulse amplitude on a strong path could otherwise pass while m overflows f32). 1 for CW. Pulse amplitudes are limited to |A| ≤ `MAX_PULSE_AMPLITUDE` = 10⁶, which keeps the envelope sums finite. For a pulse train, the largest sum of `A_i·(peak_rise + peak_fall)` over the pulses whose extents overlap one point. A pulse's extent runs from the earlier of its two shifted table starts to the **later** of its two table ends (`EdgeTableArena::pulse_extent`), because a long rise can outlast the fall's table. The peak of a table also bounds every interpolated value, because linear interpolation is a convex combination.
+
+**Culling (settled, prompt 5).** A path is dropped from a block's work list when its peak contribution is below the target's cull threshold, in LSB. The default `LOSSLESS_CULL_LSB = ¼` is **lossless**: every computed component is then below ¼·(1 + 2⁻²⁰) < ½ LSB, which rounds to 0, so output bits are identical with and without culling. A test checks this. A larger threshold may be configured, and it is then an approximation of at most that many LSB per culled path. Narrowband paths far outside the band (|H(f_off)| ≈ 0) are culled this way.
 
 **Headroom proof.** Before rendering, and again whenever the path set or amplitude bounds change, the control plane computes, per target and block:
 
@@ -253,6 +261,76 @@ Every receiver channel has two taps.
 - **Noise.** Thermal noise is added once, after the complete path sum. Its Philox stream is keyed by (seed, receiver entity, `StreamId::receiver_thermal_noise(channel)`), with counter = sample index at the rate where noise is injected (§1.5).
 - **Truth.** Truth and consumer-knowledge exports leave from the control plane. They never enter IQ samples, IQ headers or context packets.
 
+### 5.1 Tap response family (settled, prompt 5)
+
+`iqsim_core::TapResponse`. A linear-phase lowpass at complex baseband, f relative to the channel centre, with a Gaussian transition:
+
+```text
+|H(f)| = ½·[erf((f + f_c)/(√2σ)) − erf((f − f_c)/(√2σ))]      f_c = (f_p + f_s)/2
+H(f)   = |H(f)|·exp(−j2π·f·τ_g)
+h(t)   = 2f_c·sinc(2f_c(t − τ_g))·exp(−2π²σ²(t − τ_g)²)
+```
+
+- **Definition** (integers, so the identity hash is exact): passband edge f_p (µHz), stopband edge f_s (µHz), stopband attenuation A (milli-dB) and group delay τ_g (ps).
+- **σ:** solved so that the passband droop at f_p, ½·erfc(z) + ½·erfc((f_p + f_c)/(√2σ)) with z = (f_s − f_c)/(√2σ), equals 10^(−A/20), by 200 fixed bisection steps on libm `erfc`. Both Gaussian tails count. The far one matters only for very narrow passbands (review fix: f_p = 1 Hz, f_s = 1 kHz, A = 20 dB had given |H(f_p)| = 0.80).
+- **Stopband:** |H| ≤ 10^(−A/20) at and beyond f_s, decreasing monotonically. A is a minimum attenuation, not a flat floor.
+- **Passband:** droop ≤ 10^(−A/20) at f_p, with no ripple.
+- **Transition:** f_p < |f| < f_s, with |H(f_c)| = ½·erf(2f_c/(√2σ)), which is ½ to within the far tail.
+- **Group delay:** τ_g at every frequency.
+- **Validation:** `0 < f_p < f_s ≤ F_s/2` (anti-alias, compared exactly), 20 ≤ A ≤ 200 dB and 0 ≤ τ_g ≤ 1 ms.
+- **Evaluation:** inside f_c, |H| uses the sum of two erf terms. Outside f_c it uses a difference of erfc terms, so the far stopband does not cancel to zero.
+- **Truncation:** h is used on |t − τ_g| ≤ T_h = √(13/(2π²σ²)). Because |2f_c·sinc(2f_c t)| ≤ 1/(π|t|), the discarded tail has ∫|h| ≤ e⁻¹³/(13π) < 10⁻⁷. A unit test checks the numerical Fourier transform of the truncated h against H(f) to 2·10⁻⁷.
+- **Why this family:** a raised-cosine transition's impulse response decays only as 1/t³. For a 1 MHz transition and 10⁻⁵ accuracy it needs ≈ 100 µs of support, while the Gaussian transition needs ≈ 4 µs.
+- **Identity:** `TapResponseId` = SHA-256 of `"iqsim.tap-response.gauss-lowpass.v1\0" ‖ tap kind (u32) ‖ f_p ‖ f_s (i64) ‖ A (u32) ‖ τ_g (i64) ‖ rate num ‖ den (u64) ‖ centre µHz (i64)`, all little-endian. The same definition on the two taps has different identities.
+- **Narrowband fold:** a CW path's amplitude is multiplied by |H(f_off)|, and −f_off·τ_g cycles are added to its phase D0.
+
+### 5.2 Work list and CPU kernel (settled, prompt 5)
+
+`iqsim_worklist::BlockWorkList` is one render target and one block. Element types are `#[repr(C)]` with explicit padding, contain no pointers, and use `u32` indices only. Sizes are pinned by a test:
+
+| Type | Bytes | Fields |
+| --- | --- | --- |
+| `PolyRegisters` | 64 | D0..D3 as `[lo, hi]` u64 pairs |
+| `PathSegment` | 240 | delay, coord and phase registers; block u64; `AmplitudePoly` (4 × f32 + `inv_len`); target, coord units and coord source u32; `EmissionRef` (kind, index) |
+| `Pulse` | 32 | start and fall_start (Q32.32 target samples, relative to the emission time); amplitude f32; rise and fall table u32; pad |
+| `PulseTrain` | 8 | first pulse, count (sorted by start) |
+| `CwEmission` | 8 | constant complex envelope |
+| `EdgeTableHeader` | 40 | u_lo (Q32.32); first, len, log2_res; plateau (2 × f32); peak f32; pads |
+
+- **Waveform coordinate** `w(k) = F_s·(t_acq(k) − τ(k) − t_ref)`, Q32.32 target samples. `t_acq` comes from the ClockMap, so clock error moves pulse timing. `t_ref` is the origin of the source segment (for a pulse train, its emission time).
+- **Rebasing:** |w| and |pulse offsets| < 2³⁰ samples (`MAX_COORD_SAMPLES`). A long-running source gets a later origin, so `w − offset` never overflows i64.
+- **Coordinate shape (v1):** `validate()` accepts only linear, non-decreasing coordinates (D2 = D3 = 0, D1 ≥ 0), so the endpoint range check bounds every interior value. Endpoint checks alone would miss an interior wrap of a curved polynomial. Phase 3 must add an extremum and monotonicity check before it accepts cubic coordinates.
+- **Kernel:** each worker takes a contiguous chunk, jumps the coordinate and phase polynomials to the chunk start, then steps. Per sample, in this order with separate f32 operations:
+  1. `a = c0 + x(c1 + x(c2 + x·c3))`, x = f32(k)·inv_len, from scratch
+  2. the envelope: CW constant, or `Σ A_i·(G_rise(w − start_i) − G_fall(w − fall_i))`
+  3. `sincos(phase)`
+  4. the complex product
+  5. `m = a·lsb_per_volt`
+  6. `I, Q = (pr·m, pi·m)`, ties-even to i64, checked add
+- **Determinism:** every contribution depends only on k and w, never on the chunk, so output is independent of thread count, chunk size and path order. Errors are reported for the lowest failing chunk. Output is identical across 1, 2, 8 threads and chunk lengths 1 and 777 (golden `render/static_scene`).
+- **Table lookup:** `d = sat_sub(u, u_lo)`. Below 0 the value is 0. At or past the last point it is the plateau. Otherwise linear interpolation, with the weight taken from the top ≤ 24 fraction bits, which is exact in f32.
+
+### 5.3 Pulse edge tables (settled, prompt 5)
+
+`iqsim_waveform::edge`. For a linear ramp edge e of duration T_r (0 = step), response h and carrier offset f_off:
+
+```text
+G(τ) = ∫ e(τ − x)·h(x)·e^{−j2π f_off x} dx
+```
+
+The renderer multiplies G by the path's carrier rotation, which equals filtering the RF pulse by H.
+
+- **Construction:** f64 and libm in a fixed order.
+  - 8-point Gauss–Legendre on equal panels per grid cell gives ∫g and ∫(x − τ_g)g, followed by prefix sums. Each cell has enough panels that none spans more than half a cycle of |f_off| + 2f_c, so a large carrier offset is never undersampled.
+  - `G_i = S(τ_i − T_r) + (1/T_r)·∫_{τ_i−T_r}^{τ_i}(τ_i − x)g dx`, from prefix-sum differences plus one partial Gauss–Legendre cell.
+- **Grid:** 1/R target samples with R = 2^log2_res. Every resolution shares the origin `u_lo = ⌊(τ_g − T_h)·F_s·64⌋/64`.
+- **Plateau:** the analytic H(f_off), rounded to f32. It is stored as the last point of every table with the same (response, offset), so a finished pulse cancels exactly. The quadrature's own end value must match it to 10⁻⁶ (`PLATEAU_ERROR_BOUND`), which also checks that the quadrature converged; otherwise R is doubled and, at the limit, the build fails (`EdgeError::Quadrature`). (Review fix: taking the plateau from an undersampled base grid gave 0.355 instead of ≈ 0 for a 512 MHz offset at 1 MS/s.)
+- **Resolution:** start at R = 64. Build at 2R and measure the linear-interpolation error at every cell midpoint. Double R until the error is ≤ 5·10⁻⁶ of the unit edge height, up to R = 2¹², and fail otherwise.
+- **Error budget:** truncation < 10⁻⁷, interpolation ≤ 5·10⁻⁶ (measured, not proven between midpoints) and f32 storage < 6·10⁻⁸. The total is below 10⁻⁵·V_ref, which is §2's below-floor bound.
+- **Measured:** the 16 MS/s reference responses need R = 128 for both in-band and −60 MHz offsets (16 691 points). A pulse matches an untabulated Simpson reference to 3.4·10⁻⁶·V in band and 4.3·10⁻⁶·V at −60 MHz.
+- **Key:** `EdgeTableKey = (TapResponseId, EdgeShape, offset µHz)`. The output rate and tap are part of the response id.
+- **Cache preparation:** tables are immutable. A runtime frequency or response change creates a new key, whose table is built while the work list for the change's effective block is constructed, before that block can render. Blocks already built keep their tables. Eviction is the runtime's job (phase 5).
+
 ## 6. Run manifest and replay
 
 A versioned document written alongside every run. It is never part of consumer-visible output.
@@ -343,7 +421,8 @@ iqsim-core ─┬─ iqsim-units ─┬─ iqsim-contracts ─┬─ iqsim-contr
 iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 ```
 
-- **iqsim-core:** TruthTime, SampleIndex, SampleRate, `ClockMap` trait and ideal map, commit-boundary time types, fixed point, sin/cos, Philox, `NUMERIC_CONTRACT_VERSION`.
+- **iqsim-core:** TruthTime, SampleIndex, SampleRate, `ClockMap` trait and ideal map, commit-boundary time types, fixed point, sin/cos, Philox, the amplitude scale and headroom proof (§2), tap responses and their identities (§5.1), `NUMERIC_CONTRACT_VERSION`. `libm` is a normal dependency since prompt 5, for the control-plane response math only.
+- **iqsim-worklist:** the `#[repr(C)]` work-list and edge-table arena types (§5.2). **iqsim-waveform:** the edge-table builder (§5.3). **iqsim-render:** the `Backend` trait and the CPU kernel.
 - **iqsim-contracts:** pure data and pure encode/decode, with no sockets, files or simulation logic. It holds:
   - the control envelope, commands, acks and status
   - the handler traits (`CommandHandler`, `StatusProvider`)

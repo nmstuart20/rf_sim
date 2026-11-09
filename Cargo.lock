@@ -263,9 +263,11 @@ dependencies = [
  "iqsim-render",
  "iqsim-scenario",
  "iqsim-terrain",
+ "iqsim-testkit",
  "iqsim-units",
  "iqsim-waveform",
  "iqsim-worklist",
+ "libm",
 ]
 
 [[package]]
@@ -317,6 +319,7 @@ version = "0.1.0"
 dependencies = [
  "iqsim-core",
  "iqsim-units",
+ "libm",
 ]
 
 [[package]]
@@ -324,6 +327,7 @@ name = "iqsim-worklist"
 version = "0.1.0"
 dependencies = [
  "iqsim-core",
+ "sha2",
 ]
 
 [[package]]

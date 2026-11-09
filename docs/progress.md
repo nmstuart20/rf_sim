@@ -304,3 +304,69 @@ Append one entry per prompt. Newest at the bottom. Each entry covers what was bu
   - The DMS sum overflowed on `1d0m1e-100s`, and a 38-digit length in ft overflowed the exact product. Both now fall back to f64 arithmetic instead of reporting a false "too large" error.
   - The schema accepted `mgrs` together with only `lat`. Each `oneOf` branch now excludes the other form, and Python `jsonschema` confirms the rejection.
 - Added a property test: every decimal-denominator rate's `Display` parses back to the same rate.
+
+---
+
+## Prompt 5: Work list and CPU render backend (2026-11-08)
+
+**Built**
+
+- `iqsim-core`:
+  - `amplitude`: R₀ = 50 Ω RMS (`rms_volts`), `TargetScale` (V_fs → the f32 factor `lsb_per_volt = f32(2⁴⁰/V_fs)`, which defines the scale), `Headroom` (Σ ceil(peak LSB) ≤ 2⁶², error otherwise), `FULL_SCALE_PATHS = 2²²` and `LOSSLESS_CULL_LSB = ¼`.
+  - `response`: `TapKind`, `ResponseSpec` (integer f_p, f_s, A, τ_g), `TapResponse` (Gaussian-transition linear-phase lowpass: |H|, phase, H(f), truncated closed-form h(t), support) and `TapResponseId` (SHA-256 of kind, definition, rate and centre).
+- `iqsim-worklist`: `#[repr(C)]`, padding-free types with sizes pinned by a test.
+  - `PolyRegisters`, `AmplitudePoly`, `PathSegment`, `EmissionRef`, `CwEmission`, `PulseTrain`, `Pulse`, `EdgeTableHeader` and `TargetDesc`.
+  - `EdgeTableArena` and `BlockWorkList`, with `validate()` (every index, code, length, coordinate bound, pulse order, and the plateau shared by a pulse's two tables) and `content_hash()`.
+- `iqsim-waveform::edge`: deterministic band-limited edge tables for linear ramps or steps through any tap response at any offset, with adaptive resolution and a measured interpolation-error bound. Keyed by `EdgeTableKey`.
+- `iqsim-render`: the `Backend` trait and `CpuBackend` (`std::thread::scope`, contiguous chunks or a fixed chunk length dealt round-robin). The jump-then-step kernel uses a fixed f32 operation order, ties-even conversion and checked i64 adds. `edge_value` is the table lookup.
+- `iqsim-geo`: `Ecef` and `SPEED_OF_LIGHT_M_S` (minimal).
+- `iqsim-runtime::static_scene`: the temporary static-geometry builder. Friis with isotropic antennas, τ = R/c, the exact `phase_at` block-start phase plus −f_c·τ, the waveform coordinate from `ClockMap` instants, the CW response fold, culling, the peak-overlap sweep for pulse trains and the headroom proof. It builds one work list per target, so antenna-port and virtual-receiver lists are always separate.
+- Tests (including review regressions): 22 new unit tests (core 9, worklist 5, waveform 5, render 1, geo 1, runtime 1) and 11 integration tests in `crates/iqsim-runtime/tests/static_render.rs` (16 MS/s channel at 1090 MHz, H_rx 6/7.5 MHz 80 dB τ_g = 1 µs, B_out 7/8 MHz 60 dB τ_g = 0, 30 km link). Measured:
+  - **Pulse TOA** (energy centroid, group delay removed, six fractional offsets, both taps): worst 2.5·10⁻⁶ samples (bound 10⁻³).
+  - **Pulse shape against an independent Simpson quadrature** (no tables, no truncation): 3.4·10⁻⁶·V at +3 MHz and 4.3·10⁻⁶·V for a 1030 MHz pulse 60 MHz out of band (bound 10⁻⁵·V). The 1030 MHz residue at −59 dB is the pulse's real spectral splatter inside H_rx, not an alias.
+  - **CW level** within 1.1·10⁻⁷ relative of independent Friis·|H(f)| at five offsets (passband and transition) on both taps. Frequency is within 1 Hz, and phase (−f_c·τ − f·τ_g) within 10⁻⁴ rad.
+  - **Out of band:** 1030 MHz and 1099 MHz CW are culled. With culling off, the would-be images at −4 and −7 MHz are ≤ 10⁻⁴ of the unfiltered level.
+  - **Lossless culling:** identical output with and without culling a 0.03 LSB path.
+  - **Determinism:** identical across 1, 2 and 8 threads and chunk lengths 777 and 1, for two blocks and both taps, with a pulse train straddling the block boundary. New golden `render/static_scene`, blessed for the first time. No existing golden changed.
+  - **Headroom:** a 10⁻²⁰ V full scale is rejected. A hand-made list that bypasses the proof fails with `Overflow` (checked add) or `Contribution` (above i64), and never wraps.
+  - **Tap isolation (basic):** the antenna-port work-list hash and output are unchanged across two different virtual-receiver responses and full scales. The virtual output does change.
+- Docs: contracts §2 (scale factor, peak overlap, culling), new §5.1 (response family), §5.2 (work-list layout and kernel) and §5.3 (edge tables, keys, cache preparation), and §9. AGENTS.md has invariants for normalization/headroom and band-limiting before sampling.
+
+**Deviations**
+
+- **Response family.** A Gaussian-transition lowpass (sinc × Gaussian impulse response) instead of an unspecified filter. "Stopband attenuation A" means ≥ A dB at and beyond f_s, decreasing monotonically, not a flat floor. A raised cosine was rejected because its 1/t³ tails need ~25× longer edge tables for the same accuracy. A measured or arbitrary H (FIR taps, a receiver profile's own curve) would be a new response kind with its own identity tag.
+- `fs ≤ F_s/2` is required, so the anti-alias condition holds before folding. The scenario's single `bandwidth` field is not mapped to (f_p, f_s, A, τ_g) yet. That happens when the scenario is wired to the renderer (prompt 6).
+- **Edge shapes:** linear ramp (and step) only. Other shapes become new `EdgeShape` variants and keys.
+- **Interpolation error** is measured at every cell midpoint against a 2× table, not proven between points (stated in contracts §5.3).
+- **The delay polynomial** is in the work list for truth and diagnostics. The kernel reads time only from the waveform coordinate, and phase from the phase polynomial.
+- **Placement:** the response and amplitude code went into `iqsim-core` (waveform, receiver and the builder all need it, and core is their only common dependency), and `libm` became a normal dependency of core for that control-plane math. The edge-table arena lives in `iqsim-worklist` and the builder in `iqsim-waveform`; the runtime copies tables into the arena. The static builder lives in `iqsim-runtime`. No dependency edges were added.
+- **The static builder** ignores Earth rotation (no Sagnac) and light-time iteration, and accepts only clock maps that are linear over a block (midpoint residual ≤ 10⁻⁶ sample). Phase 3 replaces it.
+- **Pulse offsets** convert from ps to Q32.32 target samples by floor, with the whole-sample quotient split from the remainder so no intermediate overflows. The result is within 2⁻³² samples.
+- **Work-list validation** accepts only linear, non-decreasing waveform coordinates for now (contracts §5.2). Phase 3 must add an extremum check for cubic coordinates.
+- The static builder rejects links with |f_c·τ| > 2⁴⁰ cycles, where f64 can no longer resolve the propagation phase to 7.7·10⁻⁴ rad. The phase 3 fitter needs a modular propagation phase for longer links.
+- A CW emission is always on. Keyed CW must be rendered as pulse edges so that it stays band-limited.
+
+**Dependencies**
+
+- No new external crates. `libm` (vetted in prompt 3) is now a normal dependency of `iqsim-core` and `iqsim-waveform`. `sha2` (already used by core) is a normal dependency of `iqsim-worklist` for `content_hash`. `iqsim-testkit` and `libm` are dev-dependencies of `iqsim-runtime`.
+
+**Open questions**
+
+- With the exact `OffsetFrequency::from_uhz`, the residual frequency rounding (≤ ½ · 2⁻³² Hz) still gives up to ~6 mrad of phase over 100 days for offsets not representable exactly. It is within the 0.01 rad budget, but the phase 3 fitter should count it.
+- The edge-table cache has no eviction yet. The runtime (phase 5) should drop tables whose keys no block after C references.
+- The CPU kernel filters active pulses per chunk with a linear scan. That is fine for Mode A/C. Dense pulse trains may want a binary search (phase 7 performance work).
+- Noise shaping by a "digital equivalent of H_rx" (prompt 6) can sample `TapResponse::response` directly.
+
+**Independent review (Codex CLI, `high` reasoning, read-only, about 25 minutes)**
+
+- It confirmed no padding, prohibited-transcendental, HashMap or FMA issues, and the 8 integration tests passed. It found eight issues, all fixed, each with a regression test:
+  - **P1, edge-table plateau.** At 1 MS/s with a 512 MHz offset, one Gauss–Legendre rule per 15.6 ns cell undersampled the carrier, and the base-grid plateau came out 0.355 instead of ≈ 0. Refinement then copied that value into every table. Fixed with panels of at most half a cycle of |f_off| + 2f_c, the analytic H(f_off) as the shared plateau, and a quadrature convergence check against it (`EdgeError::Quadrature`).
+  - **P1, pulse extent.** A rise that outlasts the fall table (rise 10 µs, fall start 1 µs, fall 0) left a non-zero tail after the extent the kernel and builder assumed, so small chunks dropped it. The extent is now the later of both table ends (`pulse_extent`), and a test renders the pulse with chunk lengths 1, 7, 64, 777 and the whole block.
+  - **µHz → f64 → `OffsetFrequency`** drifted 0.0375 rad over 100 days at 7 MHz + 1 µHz. Added the exact integer `OffsetFrequency::from_uhz`.
+  - **σ solve** ignored the far Gaussian tail: f_p = 1 Hz, f_s = 1 kHz, A = 20 dB gave |H(f_p)| = 0.80 instead of ≥ 0.9. It now solves against the full droop expression.
+  - **`ps_to_coord`** needed 134-bit intermediates for in-range values and could panic on `abs(i64::MIN)`. The quotient and remainder are now split before the shift.
+  - **Headroom** allowed `a·lsb_per_volt` to overflow f32 when a tiny pulse amplitude hid a strong path. The envelope bound is now taken as at least 1, and |pulse amplitude| is capped at 10⁶.
+  - **Validation** checked only endpoints, so a curved coordinate could wrap in the middle. Coordinates must now be linear and non-decreasing until phase 3.
+  - **Propagation phase** −f_c·τ in f64 loses the fractional cycle at absurd ranges (2.1 rad at 10¹⁵ m). Such links are now rejected (|f_c·τ| ≤ 2⁴⁰ cycles).
+- It also noted that the determinism test's non-zero check could be met by the CW paths alone, and that both out-of-band CW tones quantized to zero even with culling off. The test now asserts that pulse trains are present in both blocks. A new case renders an 8.3 MHz tone through B_out whose −7.7 MHz image is non-zero: measured 3.8·10⁻⁷ of the unfiltered level, against a 60 dB (10⁻³) stopband.
+- No golden hash changed.

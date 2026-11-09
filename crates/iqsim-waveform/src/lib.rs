@@ -6,3 +6,7 @@
 //! Dependencies: iqsim-core, iqsim-units.
 
 #![forbid(unsafe_code)]
+
+pub mod edge;
+
+pub use edge::{BuiltEdgeTable, EdgeError, EdgeShape, EdgeTableKey, build_edge_table};

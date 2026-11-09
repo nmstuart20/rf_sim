@@ -8,10 +8,10 @@ publish.workspace = true
 
 [dependencies]
 sha2.workspace = true
+libm.workspace = true
 
 [dev-dependencies]
 iqsim-testkit.workspace = true
-libm.workspace = true
 proptest.workspace = true
 
 [lints]

@@ -66,6 +66,25 @@ impl OffsetFrequency {
         f64_to_i64_ties_even(scaled).map(Self)
     }
 
+    /// The nearest representable offset to `uhz` micro-hertz, ties to even, computed
+    /// exactly in integers (`uhz·2³²/10⁶`). Use this for scenario frequencies: going
+    /// through f64 Hz first adds a rounding that drifts by tens of mrad over 100 days.
+    pub fn from_uhz(uhz: i64) -> Result<Self, NumericError> {
+        let n = i128::from(uhz) * (1_i128 << 32);
+        let d = 1_000_000_i128;
+        let q = n.div_euclid(d);
+        let r = n.rem_euclid(d);
+        // Ties to even: round up when r > d/2, or r = d/2 and q is odd.
+        let q = if 2 * r > d || (2 * r == d && q % 2 != 0) {
+            q + 1
+        } else {
+            q
+        };
+        i64::try_from(q)
+            .map(Self)
+            .map_err(|_| NumericError::OutOfRange)
+    }
+
     /// Offset phase φ = frac(Δf·t) at the acquisition instant `t`, floored to the
     /// 2⁻⁶⁴ cycle grid. Exact for every i64 frequency and every instant.
     pub fn phase_at(self, t: AcqInstant) -> Phase {
@@ -172,6 +191,36 @@ mod tests {
         // ⌊−2⁶³·2⁶⁴ / (2⁴⁴·5¹²)⌋ = −⌈2⁸³/5¹²⌉.
         let want = (1u128 << 83).div_ceil(u128::from(FIVE_POW_12)) as u64;
         assert_eq!(got, want.wrapping_neg());
+    }
+
+    #[test]
+    fn exact_micro_hertz_conversion() {
+        assert_eq!(
+            OffsetFrequency::from_uhz(1_000_000).unwrap().to_bits(),
+            1 << 32
+        );
+        assert_eq!(
+            OffsetFrequency::from_uhz(-1_000_000).unwrap().to_bits(),
+            -(1 << 32)
+        );
+        // 1 µHz = 4294.967296 units → 4295; −1 µHz → −4295.
+        assert_eq!(OffsetFrequency::from_uhz(1).unwrap().to_bits(), 4295);
+        assert_eq!(OffsetFrequency::from_uhz(-1).unwrap().to_bits(), -4295);
+        // 15625 µHz · 2³² / 10⁶ = 67 108 864 exactly (10⁶ = 2⁶·15625).
+        assert_eq!(
+            OffsetFrequency::from_uhz(15_625).unwrap().to_bits(),
+            67_108_864
+        );
+        // Regression (prompt 5 review): 7 000 000.000001 Hz, where the f64 path errs by
+        // 6.9·10⁻¹⁰ Hz (0.0375 rad over 100 days). The exact path is within ½ unit.
+        let uhz = 7_000_000_000_001_i64;
+        let bits = OffsetFrequency::from_uhz(uhz).unwrap().to_bits();
+        let err = i128::from(bits) * 1_000_000 - i128::from(uhz) * (1_i128 << 32);
+        assert!(2 * err.abs() <= 1_000_000, "{err}");
+        assert_eq!(
+            OffsetFrequency::from_uhz(2_147_483_648_000_000),
+            Err(NumericError::OutOfRange)
+        );
     }
 
     #[test]

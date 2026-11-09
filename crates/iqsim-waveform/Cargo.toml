@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 iqsim-core.workspace = true
 iqsim-units.workspace = true
+libm.workspace = true
 
 [lints]
 workspace = true

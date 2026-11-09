@@ -21,5 +21,9 @@ iqsim-render.workspace = true
 iqsim-receiver.workspace = true
 iqsim-io.workspace = true
 
+[dev-dependencies]
+iqsim-testkit.workspace = true
+libm.workspace = true
+
 [lints]
 workspace = true
