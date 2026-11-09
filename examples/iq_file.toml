@@ -1,0 +1,66 @@
+# IQ-file emitter: a 2 MS/s SigMF recording (examples/iq/chirp_2msps, a ±0.6 MHz chirp
+# plus a 0.25 MHz tone) played on 1092 MHz and seen 2 MHz above the centre of a
+# 10 MS/s channel and an antenna port at 1090 MHz.
+# Lint it with: sim lint examples/iq_file.toml
+# Run it with:  sim run --offline examples/iq_file.toml --out /tmp/iq_file
+# Then:         sim replay /tmp/iq_file/run/manifest.json
+
+schema_version = 1
+epoch = 2026-01-01T00:00:00Z
+seed = 2
+run_mode = "offline"
+
+[metadata]
+name = "iq_file"
+description = "A looped SigMF recording at 1092 MHz seen by one receiver and one antenna port."
+
+[render]
+duration = "10 ms"
+block = "1 ms"
+
+[[platforms]]
+name = "transmitter"
+position = { lat = "38°55'00.0\"N", lon = "77°02'11.5\"W", alt = "10 m AGL" }
+
+[[platforms]]
+name = "site"
+position = { mgrs = "18SUJ2337106519", alt = "25 m MSL" }
+
+[[emitters]]
+name = "recording"
+platform = "transmitter"
+frequency = "1092 MHz"          # RF frequency of the recording's 0 Hz
+power = "30 dBm"                # power of a full-scale sample
+behavior = "always_on"
+waveform = "iq_file"
+iq_file = { path = "iq/chirp_2msps", start = "0.5 ms", end = "loop", normalization = "full_scale", sample_rate = "2 MS/s" }
+
+[[receivers]]
+name = "rx"
+platform = "site"
+
+[[receivers.channels]]
+name = "ch0"
+center_frequency = "1090 MHz"
+sample_rate = "10 MS/s"
+bandwidth = "8 MHz"
+front_end = { gain = "30 dB", noise_figure = "5 dB" }
+adc = { full_scale = "-30 dBm", bits = 16 }
+sinks = ["recording_rx"]
+
+[[antenna_ports]]
+name = "port"
+platform = "site"
+center_frequency = "1090 MHz"
+sample_rate = "10 MS/s"
+bandwidth = "8 MHz"
+full_scale = "-40 dBm"
+sinks = ["recording_port"]
+
+[[sinks]]
+name = "recording_rx"
+kind = "sigmf"
+
+[[sinks]]
+name = "recording_port"
+kind = "sigmf"

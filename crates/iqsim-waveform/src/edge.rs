@@ -147,13 +147,13 @@ impl fmt::Display for EdgeError {
 impl std::error::Error for EdgeError {}
 
 /// 8-point Gauss–Legendre nodes and weights on [−1, 1].
-const GL_NODES: [f64; 4] = [
+pub(crate) const GL_NODES: [f64; 4] = [
     0.183_434_642_495_649_8,
     0.525_532_409_916_329,
     0.796_666_477_413_626_7,
     0.960_289_856_497_536_3,
 ];
-const GL_WEIGHTS: [f64; 4] = [
+pub(crate) const GL_WEIGHTS: [f64; 4] = [
     0.362_683_783_378_362,
     0.313_706_645_877_887_3,
     0.222_381_034_453_374_5,

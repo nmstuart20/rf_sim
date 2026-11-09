@@ -24,6 +24,9 @@
 //!   ([`MAX_COORD_SAMPLES`]), choosing a later origin for long-running sources, so no
 //!   fixed-point coordinate can overflow in a long run. Pulse offsets obey the same
 //!   bound, so `w − offset` always fits in i64.
+//!   A continuous emission ([`EMISSION_CONTINUOUS`]) uses [`COORD_NATIVE_SAMPLES`]
+//!   instead: Q32.32 *native source samples* relative to z\[0\] of its stage-1 window
+//!   ([`SourceWindowHeader`]), so the window origin is the rebasing origin.
 //! - **Phase** ([`PathSegment::phase`]): the total carrier rotation in cycles,
 //!   `f_off·t_acq(k) − f_c·τ(k)` plus any folded response phase (`PhasePoly`
 //!   registers, wrapping by design).
@@ -44,8 +47,8 @@ use sha2::{Digest, Sha256};
 
 /// Coordinate units code: Q32.32 target samples relative to the source origin.
 pub const COORD_TARGET_SAMPLES: u32 = 1;
-/// Coordinate units code reserved for native-rate source samples (continuous waveforms,
-/// prompt 6a).
+/// Coordinate units code: Q32.32 native-rate source samples relative to z\[0\] of the
+/// path's source window (continuous emissions, contracts §5.6).
 pub const COORD_NATIVE_SAMPLES: u32 = 2;
 
 /// Bound on |waveform coordinate| and |pulse offset|, in samples (2³⁰).
@@ -57,6 +60,18 @@ pub const MAX_COORD_BITS: i64 = MAX_COORD_SAMPLES << 32;
 pub const EMISSION_CW: u32 = 1;
 /// Emission kind code: [`PulseTrain`].
 pub const EMISSION_PULSE_TRAIN: u32 = 2;
+/// Emission kind code: [`ContinuousEmission`].
+pub const EMISSION_CONTINUOUS: u32 = 3;
+
+/// Farrow taps before the interpolation cell (nodes −2, −1).
+pub const FARROW_BEFORE: u64 = 2;
+/// Farrow taps from the cell start on (nodes 0..3).
+pub const FARROW_AFTER: u64 = 4;
+/// Largest stage-1 oversampling exponent: U = 2^log2_up ≤ 32 grid points per native
+/// sample.
+pub const MAX_WINDOW_LOG2_UP: u32 = 5;
+/// Largest source window, z samples (2²⁶), so `w·U` can never leave Q32.32.
+pub const MAX_WINDOW_LEN: u32 = 1 << 26;
 
 /// Largest accepted |pulse amplitude|. With the headroom proof's amplitude-only term
 /// (contracts §2) it keeps every f32 intermediate of the kernel finite.
@@ -137,9 +152,10 @@ impl AmplitudePoly {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EmissionRef {
-    /// [`EMISSION_CW`] or [`EMISSION_PULSE_TRAIN`].
+    /// [`EMISSION_CW`], [`EMISSION_PULSE_TRAIN`] or [`EMISSION_CONTINUOUS`].
     pub kind: u32,
-    /// Index into [`BlockWorkList::cw`] or [`BlockWorkList::trains`].
+    /// Index into [`BlockWorkList::cw`], [`BlockWorkList::trains`] or
+    /// [`BlockWorkList::continuous`].
     pub index: u32,
 }
 
@@ -159,7 +175,7 @@ pub struct PathSegment {
     pub amplitude: AmplitudePoly,
     /// Render target index (always 0 within one work list: one list per target).
     pub target: u32,
-    /// [`COORD_TARGET_SAMPLES`] (or, later, [`COORD_NATIVE_SAMPLES`]).
+    /// [`COORD_TARGET_SAMPLES`], or [`COORD_NATIVE_SAMPLES`] for a continuous emission.
     pub coord_units: u32,
     /// Source segment whose origin `t_ref` the coordinate is relative to.
     pub coord_source: u32,
@@ -174,6 +190,88 @@ pub struct PathSegment {
 pub struct CwEmission {
     /// Complex envelope (re, im), unitless.
     pub envelope: [f32; 2],
+}
+
+/// A continuous emission: the path's envelope is the stage-1 window `window`
+/// interpolated by the 6-tap Farrow kernel at the path's native coordinate.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContinuousEmission {
+    /// Index into [`SourceWindowArena::headers`].
+    pub window: u32,
+    /// Explicit padding (zero).
+    pub _pad: u32,
+}
+
+/// Header of one stage-1 window: the source filtered to one target's response, on a
+/// grid of U = 2^log2_up points per native sample. Point i is z at native coordinate
+/// i/U relative to the window origin.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SourceWindowHeader {
+    /// First point in [`SourceWindowArena::samples`].
+    pub first: u32,
+    /// Number of points (≥ [`FARROW_BEFORE`] + [`FARROW_AFTER`], ≤ [`MAX_WINDOW_LEN`]).
+    pub len: u32,
+    /// log2 of the oversampling U, ≤ [`MAX_WINDOW_LOG2_UP`].
+    pub log2_up: u32,
+    /// Explicit padding (zero).
+    pub _pad: u32,
+    /// max |point|, the envelope bound before the Farrow kernel's Lebesgue constant.
+    pub peak: f32,
+    /// Explicit padding (zero).
+    pub _pad2: u32,
+}
+
+/// Immutable stage-1 windows of one block, shared by every path that references them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceWindowArena {
+    /// Window headers.
+    pub headers: Vec<SourceWindowHeader>,
+    /// Complex points (re, im) of every window, concatenated.
+    pub samples: Vec<[f32; 2]>,
+}
+
+impl SourceWindowArena {
+    /// Appends a window and returns its index.
+    pub fn push(&mut self, log2_up: u32, samples: &[[f32; 2]]) -> Result<u32, WorkListError> {
+        let len = u32::try_from(samples.len()).map_err(|_| WorkListError::Window)?;
+        if log2_up > MAX_WINDOW_LOG2_UP
+            || u64::from(len) < FARROW_BEFORE + FARROW_AFTER
+            || len > MAX_WINDOW_LEN
+            || !samples.iter().all(|p| p[0].is_finite() && p[1].is_finite())
+        {
+            return Err(WorkListError::Window);
+        }
+        // In f64, so neither tiny nor huge components underflow or overflow, then
+        // rounded up to the next f32 so the stored peak is a bound (review fix).
+        let peak64 = samples
+            .iter()
+            .map(|p| {
+                let (r, i) = (f64::from(p[0]), f64::from(p[1]));
+                (r * r + i * i).sqrt()
+            })
+            .fold(0.0_f64, f64::max);
+        let mut peak = peak64 as f32;
+        if f64::from(peak) < peak64 {
+            peak = f32::from_bits(peak.to_bits() + 1);
+        }
+        if !peak.is_finite() {
+            return Err(WorkListError::Window);
+        }
+        let first = u32::try_from(self.samples.len()).map_err(|_| WorkListError::Window)?;
+        let index = u32::try_from(self.headers.len()).map_err(|_| WorkListError::Window)?;
+        self.samples.extend_from_slice(samples);
+        self.headers.push(SourceWindowHeader {
+            first,
+            len,
+            log2_up,
+            _pad: 0,
+            peak,
+            _pad2: 0,
+        });
+        Ok(index)
+    }
 }
 
 /// A run of pulses sharing one emission reference time.
@@ -327,8 +425,12 @@ pub struct BlockWorkList {
     pub trains: Vec<PulseTrain>,
     /// Pulses of every train.
     pub pulses: Vec<Pulse>,
+    /// Continuous emissions.
+    pub continuous: Vec<ContinuousEmission>,
     /// Edge tables (shared, immutable).
     pub tables: Arc<EdgeTableArena>,
+    /// Stage-1 source windows of this block (shared, immutable).
+    pub windows: Arc<SourceWindowArena>,
 }
 
 /// A malformed work list or table.
@@ -346,6 +448,8 @@ pub enum WorkListError {
     },
     /// An edge table header is malformed.
     Table,
+    /// A source window header is malformed.
+    Window,
 }
 
 impl fmt::Display for WorkListError {
@@ -354,6 +458,7 @@ impl fmt::Display for WorkListError {
             Self::Path { index } => write!(f, "work list path {index} is malformed"),
             Self::Pulse { train } => write!(f, "work list pulse train {train} is malformed"),
             Self::Table => f.write_str("edge table is malformed"),
+            Self::Window => f.write_str("source window is malformed"),
         }
     }
 }
@@ -376,19 +481,41 @@ impl BlockWorkList {
                 return Err(WorkListError::Table);
             }
         }
+        let windows = &self.windows;
+        for h in &windows.headers {
+            let end = u64::from(h.first) + u64::from(h.len);
+            if u64::from(h.len) < FARROW_BEFORE + FARROW_AFTER
+                || h.len > MAX_WINDOW_LEN
+                || h.log2_up > MAX_WINDOW_LOG2_UP
+                || end > windows.samples.len() as u64
+            {
+                return Err(WorkListError::Window);
+            }
+        }
         if self.len == 0 || self.len > iqsim_core::MAX_BLOCK_LEN {
             return Err(WorkListError::Path { index: 0 });
         }
         for (index, p) in self.paths.iter().enumerate() {
             let bad = || WorkListError::Path { index };
+            let i = p.emission.index as usize;
+            // The window a continuous path reads, if any.
+            let mut window = None;
             let emission_ok = match p.emission.kind {
-                EMISSION_CW => (p.emission.index as usize) < self.cw.len(),
-                EMISSION_PULSE_TRAIN => (p.emission.index as usize) < self.trains.len(),
+                EMISSION_CW => i < self.cw.len() && p.coord_units == COORD_TARGET_SAMPLES,
+                EMISSION_PULSE_TRAIN => {
+                    i < self.trains.len() && p.coord_units == COORD_TARGET_SAMPLES
+                }
+                EMISSION_CONTINUOUS => {
+                    window = self
+                        .continuous
+                        .get(i)
+                        .and_then(|c| windows.headers.get(c.window as usize));
+                    window.is_some() && p.coord_units == COORD_NATIVE_SAMPLES
+                }
                 _ => false,
             };
             if p.block != self.block
                 || p.target != 0
-                || p.coord_units != COORD_TARGET_SAMPLES
                 || !emission_ok
                 || !p.amplitude.c.iter().all(|c| c.is_finite())
                 || !p.amplitude.inv_len.is_finite()
@@ -412,10 +539,29 @@ impl BlockWorkList {
             if d[2] != U128::ZERO || d[3] != U128::ZERO || (d[1].hi as i64) < 0 {
                 return Err(bad());
             }
+            // The endpoints bound the interior only if D0 + (len − 1)·D1 does not wrap
+            // mod 2¹²⁸ (review fix: a huge D1 can wrap back into range).
+            let signed = |r: U128| ((u128::from(r.hi) << 64) | u128::from(r.lo)) as i128;
+            if signed(d[1])
+                .checked_mul(i128::from(self.len - 1))
+                .and_then(|span| span.checked_add(signed(d[0])))
+                .is_none()
+            {
+                return Err(bad());
+            }
             for k in [0, self.len - 1] {
                 let w = coord.eval(k).map_err(|_| bad())?.to_bits();
                 if w.abs() >= MAX_COORD_BITS {
                     return Err(bad());
+                }
+                // Every Farrow tap of a continuous path lies inside its window. The
+                // coordinate is linear and non-decreasing, so the endpoints bound it.
+                if let Some(h) = window {
+                    let cell = w >> (32 - h.log2_up);
+                    if cell < FARROW_BEFORE as i64 || cell + FARROW_AFTER as i64 > i64::from(h.len)
+                    {
+                        return Err(bad());
+                    }
                 }
             }
         }
@@ -497,6 +643,20 @@ impl BlockWorkList {
             h.update(p.rise_table.to_le_bytes());
             h.update(p.fall_table.to_le_bytes());
         }
+        h.update((self.continuous.len() as u64).to_le_bytes());
+        for c in &self.continuous {
+            h.update(c.window.to_le_bytes());
+        }
+        h.update((self.windows.headers.len() as u64).to_le_bytes());
+        for w in &self.windows.headers {
+            for v in [w.first, w.len, w.log2_up] {
+                h.update(v.to_le_bytes());
+            }
+        }
+        for p in &self.windows.samples {
+            h.update(p[0].to_le_bytes());
+            h.update(p[1].to_le_bytes());
+        }
         h.update((self.tables.headers.len() as u64).to_le_bytes());
         for t in &self.tables.headers {
             h.update(t.u_lo.to_le_bytes());
@@ -541,6 +701,8 @@ mod tests {
         assert_eq!(size_of::<Pulse>(), 8 + 8 + 4 * 4);
         assert_eq!(size_of::<EdgeTableHeader>(), 8 + 4 * 4 + 8 + 4 + 4);
         assert_eq!(size_of::<TargetDesc>(), 32 + 4 + 4);
+        assert_eq!(size_of::<ContinuousEmission>(), 8);
+        assert_eq!(size_of::<SourceWindowHeader>(), 6 * 4);
     }
 
     #[test]
@@ -638,7 +800,9 @@ mod tests {
                 fall_table: 0,
                 _pad: 0,
             }],
+            continuous: vec![],
             tables: Arc::new(arena),
+            windows: Arc::new(SourceWindowArena::default()),
         };
         wl.validate().unwrap();
         let h = wl.content_hash();
@@ -666,5 +830,101 @@ mod tests {
         wl.paths[0].emission.kind = EMISSION_CW;
         assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
         assert_ne!(wl.content_hash(), h);
+    }
+
+    #[test]
+    fn continuous_paths_must_keep_every_farrow_tap_in_their_window() {
+        let len = 100;
+        let mut windows = SourceWindowArena::default();
+        assert_eq!(
+            windows.push(2, &[[0.0, 0.0]; 5]),
+            Err(WorkListError::Window)
+        );
+        assert_eq!(
+            windows.push(6, &[[0.0, 0.0]; 64]),
+            Err(WorkListError::Window)
+        );
+        assert_eq!(
+            windows.push(2, &[[f32::NAN, 0.0]; 64]),
+            Err(WorkListError::Window)
+        );
+        // 64 points at U = 4: native coordinates 0 .. 16.
+        let win = windows.push(2, &[[0.5, -0.5]; 64]).unwrap();
+        // The stored peak is the f64 magnitude rounded up to an f32 bound.
+        let p = windows.headers[0].peak;
+        assert!(f64::from(p) >= 0.5_f64.sqrt() && f64::from(p) - 0.5_f64.sqrt() < 1e-7);
+        // Tiny values keep a non-zero peak (review fix: f32 squares underflowed).
+        let mut tiny = SourceWindowArena::default();
+        tiny.push(0, &[[1e-30, -1e-30]; 8]).unwrap();
+        assert!(tiny.headers[0].peak >= 1.4e-30);
+        // Coordinate 0.5 + 0.1·k native samples: cells 2 .. 41, taps 0 .. 44.
+        let path = |w0: f64| {
+            let coord = DelayPoly::from_f64_differences([w0, 0.1, 0.0, 0.0], len).unwrap();
+            let zero = DelayPoly::from_f64_differences([0.0; 4], len).unwrap();
+            let phase = PhasePoly::from_f64_differences([0.0; 4], len).unwrap();
+            PathSegment {
+                delay: PolyRegisters::from_poly(&zero),
+                coord: PolyRegisters::from_poly(&coord),
+                phase: PolyRegisters::from_poly(&phase),
+                block: 0,
+                amplitude: AmplitudePoly::constant(1.0, len),
+                target: 0,
+                coord_units: COORD_NATIVE_SAMPLES,
+                coord_source: 0,
+                emission: EmissionRef {
+                    kind: EMISSION_CONTINUOUS,
+                    index: 0,
+                },
+            }
+        };
+        let mut wl = BlockWorkList {
+            target: TargetDesc {
+                response: [0; 32],
+                tap_kind: 2,
+                lsb_per_volt: 1.0,
+            },
+            block: 0,
+            first_sample: 0,
+            len,
+            paths: vec![path(0.5)],
+            cw: vec![],
+            trains: vec![],
+            pulses: vec![],
+            continuous: vec![ContinuousEmission {
+                window: win,
+                _pad: 0,
+            }],
+            tables: Arc::new(EdgeTableArena::default()),
+            windows: Arc::new(windows),
+        };
+        wl.validate().unwrap();
+        // Too early: cell 1 needs tap −1.
+        wl.paths[0] = path(0.25);
+        assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
+        // Too late: 6.2 + 9.9 = 16.1 native samples runs past the window.
+        wl.paths[0] = path(6.2);
+        assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
+        // Just inside: last cell 60, taps up to 63.
+        wl.paths[0] = path(5.1);
+        wl.validate().unwrap();
+        // Target-sample units are wrong for a continuous emission.
+        wl.paths[0].coord_units = COORD_TARGET_SAMPLES;
+        assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
+        wl.paths[0].coord_units = COORD_NATIVE_SAMPLES;
+        // Review regression: a slope that wraps the 128-bit register over the block
+        // ends back inside the window but is rejected.
+        let mut regs = DelayPoly::from_f64_differences([0.5, 0.0, 0.0, 0.0], len)
+            .unwrap()
+            .registers();
+        // D1 = 2¹²⁸/99 + ε: 99 steps wrap once and land just past the start.
+        regs[1] = U128::new(0x0295_FAD4_0A57_EB50, 0x295F_AD40_A57E_B504);
+        let wrapped = DelayPoly::from_registers(regs, len).unwrap();
+        let saved = wl.paths[0].coord;
+        wl.paths[0].coord = PolyRegisters::from_poly(&wrapped);
+        assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
+        wl.paths[0].coord = saved;
+        wl.validate().unwrap();
+        wl.continuous[0].window = 1;
+        assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
     }
 }

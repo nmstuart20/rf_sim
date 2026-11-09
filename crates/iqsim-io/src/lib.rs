@@ -5,12 +5,15 @@
 //!
 //! [`sigmf`] provides checked recording writes and readback helpers; [`utc`]
 //! formats receiver-reported timestamps using integer calendar arithmetic.
+//! [`iq_input`] validates SigMF emitter inputs and reads them through a bounded,
+//! hash-verified page cache.
 //!
 //! Dependencies: iqsim-core, iqsim-contracts.
 
 #![forbid(unsafe_code)]
 
 mod error;
+pub mod iq_input;
 pub mod sigmf;
 pub mod utc;
 

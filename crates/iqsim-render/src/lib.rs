@@ -11,7 +11,8 @@
 //! 2. Envelope `(er, ei)`: the CW envelope, or for a pulse train
 //!    `Σ_i A_i·(G_rise(w − start_i) − G_fall(w − fall_start_i))` over the train's pulses
 //!    in order, with w the waveform coordinate at k. Each G is a linear interpolation
-//!    of its edge table ([`edge_value`]).
+//!    of its edge table ([`edge_value`]). For a continuous emission, the 6-tap Farrow
+//!    interpolation of its stage-1 window at w ([`farrow_value`]).
 //! 3. `(s, c) = sincos(phase(k))`.
 //! 4. `pr = er·c − ei·s`, `pi = er·s + ei·c`.
 //! 5. `m = a·lsb_per_volt`, `I = pr·m`, `Q = pi·m`.
@@ -30,8 +31,8 @@ use std::fmt;
 
 use iqsim_core::{Delay, NumericError, Phase, f32_to_i64_ties_even, sincos};
 use iqsim_worklist::{
-    BlockWorkList, EMISSION_CW, EMISSION_PULSE_TRAIN, EdgeTableArena, PathSegment, Pulse,
-    WorkListError,
+    BlockWorkList, EMISSION_CONTINUOUS, EMISSION_CW, EMISSION_PULSE_TRAIN, EdgeTableArena,
+    FARROW_BEFORE, PathSegment, Pulse, SourceWindowArena, WorkListError,
 };
 
 /// A render failure. Every variant is a hard error: no partial block is valid.
@@ -123,6 +124,94 @@ pub fn edge_value(tables: &EdgeTableArena, table: u32, u: i64) -> [f32; 2] {
     [g0[0] + dr * w, g0[1] + di * w]
 }
 
+/// Power-basis coefficients of the 6-point Lagrange interpolator with nodes −2..3,
+/// `FARROW[j][i]` = coefficient of μ^j for node i − 2, each the exact rational rounded
+/// to f32 (contracts §5.6). Row 0 is the identity on node 0 and is not used.
+pub const FARROW: [[f32; 6]; 6] = [
+    [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+    [
+        1.0 / 20.0,
+        -1.0 / 2.0,
+        -1.0 / 3.0,
+        1.0,
+        -1.0 / 4.0,
+        1.0 / 30.0,
+    ],
+    [
+        -1.0 / 24.0,
+        2.0 / 3.0,
+        -5.0 / 4.0,
+        2.0 / 3.0,
+        -1.0 / 24.0,
+        0.0,
+    ],
+    [
+        -1.0 / 24.0,
+        -1.0 / 24.0,
+        5.0 / 12.0,
+        -7.0 / 12.0,
+        7.0 / 24.0,
+        -1.0 / 24.0,
+    ],
+    [
+        1.0 / 24.0,
+        -1.0 / 6.0,
+        1.0 / 4.0,
+        -1.0 / 6.0,
+        1.0 / 24.0,
+        0.0,
+    ],
+    [
+        -1.0 / 120.0,
+        1.0 / 24.0,
+        -1.0 / 12.0,
+        1.0 / 12.0,
+        -1.0 / 24.0,
+        1.0 / 120.0,
+    ],
+];
+
+/// Max over μ ∈ [0, 1) of Σ|ℓ_i(μ)| for [`FARROW`] (1.3910…, rounded up): the factor by
+/// which interpolation can exceed the window's peak.
+pub const FARROW_LEBESGUE: f64 = 1.3911;
+
+/// Value of source window `window` at native coordinate `w` (Q32.32, relative to the
+/// window's z\[0\]) by the 6-tap Farrow kernel. The caller guarantees, through
+/// [`BlockWorkList::validate`], that all six taps lie inside the window.
+///
+/// Operation order, per component, every f32 operation separate: `u = w << log2_up`,
+/// `m = u >> 32`, μ = the top 24 bits of the fraction (exact in f32);
+/// `c_j = Σ_{i=0..5} FARROW[j][i]·z[m − 2 + i]` for j = 1..5 in increasing i, starting
+/// from the i = 0 product; then `y = z[m] + μ·(c1 + μ·(c2 + μ·(c3 + μ·(c4 + μ·c5))))`
+/// evaluated from the innermost term outward.
+#[inline]
+pub fn farrow_value(windows: &SourceWindowArena, window: u32, w: i64) -> [f32; 2] {
+    let h = &windows.headers[window as usize];
+    let u = w << h.log2_up;
+    let m = (u >> 32) as usize;
+    let mu = (((u as u64) & 0xFFFF_FFFF) >> 8) as f32 * (1.0 / 16_777_216.0);
+    let base = h.first as usize + m - FARROW_BEFORE as usize;
+    let z = &windows.samples[base..base + 6];
+    let mut out = [0.0_f32; 2];
+    for (part, o) in out.iter_mut().enumerate() {
+        let mut c = [0.0_f32; 6];
+        for (j, cj) in c.iter_mut().enumerate().skip(1) {
+            let row = &FARROW[j];
+            let mut acc = row[0] * z[0][part];
+            for i in 1..6 {
+                acc += row[i] * z[i][part];
+            }
+            *cj = acc;
+        }
+        let mut y = c[5];
+        for j in (1..5).rev() {
+            y = c[j] + mu * y;
+        }
+        *o = z[2][part] + mu * y;
+    }
+    out
+}
+
 /// The multithreaded CPU golden-reference backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuBackend {
@@ -154,7 +243,8 @@ struct PathChunk<'a> {
     /// Pulses of the train that can be non-zero inside the chunk (empty for CW).
     pulses: Vec<&'a Pulse>,
     cw: [f32; 2],
-    is_cw: bool,
+    kind: u32,
+    window: u32,
 }
 
 fn render_chunk(
@@ -173,10 +263,13 @@ fn render_chunk(
             path,
             pulses: Vec::new(),
             cw: [0.0, 0.0],
-            is_cw: path.emission.kind == EMISSION_CW,
+            kind: path.emission.kind,
+            window: 0,
         };
-        if pc.is_cw {
+        if pc.kind == EMISSION_CW {
             pc.cw = work.cw[path.emission.index as usize].envelope;
+        } else if pc.kind == EMISSION_CONTINUOUS {
+            pc.window = work.continuous[path.emission.index as usize].window;
         } else {
             debug_assert_eq!(path.emission.kind, EMISSION_PULSE_TRAIN);
             // The coordinate is non-decreasing over a block (builder contract), so the
@@ -200,8 +293,10 @@ fn render_chunk(
         for i in 0..n as usize {
             let k = k0 + i as u64;
             let a = pc.path.amplitude.eval(k);
-            let env = if pc.is_cw {
+            let env = if pc.kind == EMISSION_CW {
                 pc.cw
+            } else if pc.kind == EMISSION_CONTINUOUS {
+                farrow_value(&work.windows, pc.window, coord_c.value().to_bits())
             } else {
                 let w = coord_c.value().to_bits();
                 let mut e = [0.0_f32, 0.0_f32];
@@ -311,5 +406,45 @@ mod tests {
         assert_eq!(edge_value(&t, id, (2 << 32) + (1 << 30)), [1.0, -1.0]);
         assert_eq!(edge_value(&t, id, (2 << 32) + (1 << 31)), [2.0, 0.5]);
         assert_eq!(edge_value(&t, id, 100 << 32), [2.0, 0.5]);
+    }
+
+    #[test]
+    fn farrow_reproduces_quintics_and_meets_its_lebesgue_bound() {
+        // A quintic through the nodes is reproduced exactly (up to f32 rounding), and
+        // the coefficient rows sum to the identity's polynomial (Σ_i row_j = δ_j0).
+        let p = |x: f64| 0.3 + x * (-0.2 + x * (0.05 + x * (0.01 + x * (-0.002 + x * 0.0003))));
+        let mut a = SourceWindowArena::default();
+        let pts: Vec<[f32; 2]> = (0..12).map(|i| [p(f64::from(i)) as f32, 0.0]).collect();
+        let win = a.push(0, &pts).unwrap();
+        for k in 0..=64 {
+            let x = 4.0 + f64::from(k) / 64.0;
+            let w = (x * 4_294_967_296.0) as i64;
+            let v = farrow_value(&a, win, w);
+            assert!((f64::from(v[0]) - p(x)).abs() < 2e-6, "x = {x}");
+        }
+        for row in &FARROW[1..] {
+            let s: f64 = row.iter().map(|&c| f64::from(c)).sum();
+            assert!(s.abs() < 1e-7);
+        }
+        // Lebesgue constant by brute force over μ.
+        let mut leb = 0.0_f64;
+        for k in 0..=4096 {
+            let mu = f64::from(k) / 4096.0;
+            let mut s = 0.0;
+            for i in -2..=3_i32 {
+                let mut l = 1.0;
+                for j in -2..=3_i32 {
+                    if j != i {
+                        l *= (mu - f64::from(j)) / f64::from(i - j);
+                    }
+                }
+                s += f64::abs(l);
+            }
+            leb = leb.max(s);
+        }
+        assert!(
+            leb <= FARROW_LEBESGUE && leb > FARROW_LEBESGUE - 1e-3,
+            "{leb}"
+        );
     }
 }

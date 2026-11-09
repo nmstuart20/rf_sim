@@ -34,9 +34,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use iqsim_contracts::{
-    AssetRegistry, BackendRecord, BuildIdentity, MANIFEST_SCHEMA_VERSION, NondeterministicRecord,
-    OutputRecord, RunManifest, ScenarioRecord, TruthRecord, canonical_json, canonical_sha256,
-    sha256_hex,
+    AssetKind, AssetRegistry, BackendRecord, BuildIdentity, MANIFEST_SCHEMA_VERSION,
+    NondeterministicRecord, OutputRecord, RunManifest, ScenarioRecord, TruthRecord, canonical_json,
+    canonical_sha256, sha256_hex,
 };
 use iqsim_core::{
     BlockSpec, ClockMap, IdealTimestampClock, NUMERIC_CONTRACT_VERSION, SampleIndex, TapKind,
@@ -169,10 +169,11 @@ pub fn load_scenario(path: &Path) -> Result<LoadedScenario, RunError> {
             .collect();
         return Err(RunError::Scenario(text));
     }
+    let resolved = resolve(&scenario, abs.parent().unwrap_or(Path::new("/")))?;
     Ok(LoadedScenario {
         path: abs,
         bytes,
-        resolved: resolve(&scenario)?,
+        resolved,
     })
 }
 
@@ -185,7 +186,8 @@ fn render_stream(
 ) -> Result<u64, RunError> {
     let r = &plan.resolved;
     let blocks = BlockSpec::new(r.block_len).map_err(SceneError::Time)?;
-    let builder = StaticSceneBuilder::new(&plan.scene, &plan.target, &plan.clock, blocks)?;
+    let builder = StaticSceneBuilder::new(&plan.scene, &plan.target, &plan.clock, blocks)?
+        .with_sample_limit(r.sample_count);
     let mut chain = match plan.chain {
         Some(c) => Some(ReceiverChannelState::new(c)?),
         None => None,
@@ -232,6 +234,7 @@ fn tap_name(plan: &StreamPlan) -> &'static str {
     match plan.target.kind {
         TapKind::AntennaPort => "antenna_port",
         TapKind::VirtualReceiver => "virtual_receiver",
+        TapKind::SourceReconstruction => unreachable!("streams are taps"),
     }
 }
 
@@ -288,7 +291,7 @@ pub fn truth_record(plan: &RunPlan) -> Result<Value, RunError> {
             let offset_hz = (e.carrier_uhz - t.center_uhz) as f64 * 1e-6;
             let gain = resp.magnitude(offset_hz);
             let delay_s = range / iqsim_geo::SPEED_OF_LIGHT_M_S;
-            links.push(json!({
+            let mut link = json!({
                 "stream": s.resolved.id,
                 "emitter": re.name,
                 "range_m": range,
@@ -297,7 +300,32 @@ pub fn truth_record(plan: &RunPlan) -> Result<Value, RunError> {
                 "carrier_offset_hz": offset_hz,
                 "response_gain": gain,
                 "power_at_target_w": e.power_w * (path * path) * (gain * gain),
-            }));
+            });
+            if let Some(src) = &re.source {
+                // A wideband source has no single response gain: report the level of
+                // its reference (a full-scale or RMS tone) before band limiting, and
+                // where its samples land.
+                let native_hz = src.rate_num as f64 / src.rate_den as f64;
+                let map = link.as_object_mut().expect("link is an object");
+                map.remove("response_gain");
+                map.remove("power_at_target_w");
+                map.insert(
+                    "reference_power_at_target_w".to_owned(),
+                    json!(e.power_w * (path * path)),
+                );
+                map.insert(
+                    "iq_file".to_owned(),
+                    json!({
+                        "start_ps": src.start_ps,
+                        "native_rate": [src.rate_num, src.rate_den],
+                        "delay_native_samples": delay_s * native_hz,
+                        "sample_count": src.sample_count,
+                        "end": src.end,
+                        "group_delay_s": resp.group_delay_s(),
+                    }),
+                );
+            }
+            links.push(link);
         }
     }
     Ok(json!({ "truth_schema_version": 1, "streams": streams, "links": links }))
@@ -357,6 +385,73 @@ fn write_samples_sigmf(w: &mut SigmfWriter, s: &Samples) -> Result<(), RunError>
         Samples::Cf32(v) => w.write_cf32(v)?,
     }
     Ok(())
+}
+
+/// Every external input the resolved scenario names (contracts §6): per IQ-file
+/// emitter its data file (with the parameters that interpret it as metadata) and its
+/// `.sigmf-meta` file.
+pub fn asset_registry(resolved: &ResolvedScenario) -> Result<AssetRegistry, RunError> {
+    let mut reg = AssetRegistry::new();
+    let sha = |hex_text: &str| -> Result<[u8; 32], RunError> {
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(hex_text, &mut out)
+            .map_err(|e| RunError::Io(format!("bad asset hash: {e}")))?;
+        Ok(out)
+    };
+    for e in &resolved.emitters {
+        let Some(src) = &e.source else { continue };
+        let meta = json!({
+            "datatype": src.datatype,
+            "rate": [src.rate_num, src.rate_den],
+            "sample_count": src.sample_count,
+            "start_ps": src.start_ps,
+            "end": src.end,
+            "normalization": src.normalization,
+            "scale": src.scale,
+            "response": serde_json::to_value(src.response).expect("response serializes"),
+            "meta_sha256": src.meta_sha256,
+        });
+        reg.register_digest(
+            AssetKind::IqInput,
+            &format!("{}.data", e.name),
+            &src.data_path,
+            src.data_byte_len,
+            sha(&src.data_sha256)?,
+            &format!("sigmf/{}", src.datatype),
+            Some(&meta),
+        )
+        .map_err(|e| RunError::Io(e.to_string()))?;
+        reg.register_digest(
+            AssetKind::IqInput,
+            &format!("{}.meta", e.name),
+            &src.meta_path,
+            src.meta_byte_len,
+            sha(&src.meta_sha256)?,
+            "sigmf-meta",
+            None,
+        )
+        .map_err(|e| RunError::Io(e.to_string()))?;
+    }
+    Ok(reg)
+}
+
+/// Length and SHA-256 of a file, read in bounded chunks.
+fn file_digest(path: &str) -> Result<(u64, [u8; 32]), std::io::Error> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut len = 0u64;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        len += n as u64;
+        h.update(&buf[..n]);
+    }
+    Ok((len, h.finalize().into()))
 }
 
 fn unix_ms() -> u64 {
@@ -445,7 +540,7 @@ pub fn run_offline(
         run_mode: "offline".to_owned(),
         block_ps: plan.resolved.block_ps,
         duration_ps: plan.resolved.duration_ps,
-        assets: AssetRegistry::new().records(),
+        assets: asset_registry(&plan.resolved)?.records(),
         event_log: None,
         outputs,
         truth: TruthRecord {
@@ -515,7 +610,7 @@ pub fn replay(manifest_path: &Path, options: RunOptions) -> Result<ReplayReport,
             "the manifest's resolved scenario does not match its hash".to_owned(),
         ));
     }
-    AssetRegistry::verify(&m.assets, |p: &str| fs::read(p).map_err(|e| e.to_string()))
+    AssetRegistry::verify_digests(&m.assets, file_digest)
         .map_err(|e| RunError::Replay(e.to_string()))?;
     let loaded = load_scenario(source)?;
     let resolved = serde_json::to_value(&loaded.resolved).expect("resolved scenario serializes");

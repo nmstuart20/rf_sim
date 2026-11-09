@@ -67,6 +67,9 @@ pub enum TapKind {
     AntennaPort = 1,
     /// The virtual receiver: H_rx(f), receiver ClockMap, the full receiver chain.
     VirtualReceiver = 2,
+    /// Not a tap: the reconstruction response φ(f) that defines the continuous signal of
+    /// a sampled source (an IQ file) at its native rate (contracts §5.6).
+    SourceReconstruction = 3,
 }
 
 impl TapKind {

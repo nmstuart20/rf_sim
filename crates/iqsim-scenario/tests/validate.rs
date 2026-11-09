@@ -167,3 +167,80 @@ fn syntax_errors_are_located() {
     assert_eq!(found[0].location(source), Some((3, 8)));
     assert_eq!(line_col(source, 0), (1, 1));
 }
+
+#[test]
+fn iq_file_emitters() {
+    let platform =
+        "[[platforms]]\nname = \"p\"\nposition = { lat = 0, lon = 0, alt = \"0 m ellipsoid\" }\n";
+    let emitter = |name: &str, waveform: &str, iq: &str| {
+        format!(
+            "[[emitters]]\nname = \"{name}\"\nplatform = \"p\"\nfrequency = \"1 GHz\"\npower = \"0 dBm\"\nbehavior = \"always_on\"\nwaveform = \"{waveform}\"\n{iq}\n"
+        )
+    };
+    let clean = format!(
+        "{platform}{}",
+        emitter(
+            "a",
+            "iq_file",
+            r#"iq_file = { path = "rec", start = "1 ms", end = "loop", normalization = "rms", sample_rate = "2 MS/s", response = { bandwidth = "1.5 MHz", stopband = "2 MHz", attenuation = "90 dB" } }"#
+        )
+    );
+    assert!(errors(&clean).is_empty(), "{:?}", errors(&clean));
+    let body = format!(
+        "{platform}{}{}{}{}",
+        emitter("missing", "iq_file", ""),
+        emitter(
+            "stray",
+            "cw",
+            r#"iq_file = { path = "rec", end = "stop", normalization = "full_scale" }"#
+        ),
+        emitter(
+            "bad",
+            "iq_file",
+            r#"iq_file = { path = " ", start = "-1 ms", end = "zero_pad", normalization = "rms", sample_rate = "2 MS/s", response = { bandwidth = "3 MHz", stopband = "1 MHz", attenuation = "10 dB" } }"#
+        ),
+        emitter(
+            "ok",
+            "iq_file",
+            r#"iq_file = { path = "x", end = "loop", normalization = "rms" }"#
+        ),
+    );
+    let messages: Vec<String> = errors(&body).into_iter().map(|(_, _, m)| m).collect();
+    for needle in [
+        "emitter \"missing\": waveform \"iq_file\" needs an iq_file table",
+        "emitter \"stray\": an iq_file table needs waveform = \"iq_file\"",
+        "emitter \"bad\": iq_file.path is empty",
+        "emitter \"bad\": iq_file.start cannot be negative",
+        "emitter \"bad\": iq_file response bandwidth exceeds the native sample rate",
+        "emitter \"bad\": iq_file response stopband must be wider than its bandwidth",
+        "emitter \"bad\": iq_file response attenuation must be 20 to 200 dB",
+    ] {
+        assert!(
+            messages.iter().any(|m| m.contains(needle)),
+            "missing {needle:?} in {messages:?}"
+        );
+    }
+    assert_eq!(messages.len(), 7, "{messages:?}");
+    // Unknown end policy or normalization is a parse error.
+    let typo = format!(
+        "{platform}{}",
+        emitter(
+            "t",
+            "iq_file",
+            r#"iq_file = { path = "x", end = "forever", normalization = "rms" }"#
+        )
+    );
+    assert!(iqsim_scenario::parse(&format!("{HEAD}{typo}")).is_err());
+}
+
+#[test]
+fn examples_lint_clean() {
+    for name in ["minimal.toml", "iq_file.toml"] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples")
+            .join(name);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let found = lint(&source);
+        assert!(found.is_empty(), "{name}: {:?}", found);
+    }
+}

@@ -12,6 +12,10 @@
 //! - Clock and LO `fixed_offset` models have an `offset`, and `ideal` ones do not.
 //! - Render duration and block length are positive.
 //! - A receiver has at least one channel.
+//! - An emitter has an `iq_file` table exactly when `waveform = "iq_file"`; its start
+//!   is not negative, its path is not empty, and its source response has
+//!   0 < bandwidth < stopband (≤ the stated sample rate) and 20 to 200 dB. Checks that
+//!   need the recording itself happen when the scenario is resolved.
 //!
 //! Library references (antennas, waveforms, behaviors) are not resolved yet.
 
@@ -194,6 +198,75 @@ impl Validator {
         }
     }
 
+    fn iq_file(&mut self, e: &crate::model::Emitter, user: &str) {
+        let wants = e.waveform.as_str() == "iq_file";
+        let Some(q) = &e.iq_file else {
+            if wants {
+                self.error(
+                    e.waveform.span(),
+                    format!("{user}: waveform \"iq_file\" needs an iq_file table"),
+                );
+            }
+            return;
+        };
+        if !wants {
+            self.error(
+                q.path.span(),
+                format!(
+                    "{user}: an iq_file table needs waveform = \"iq_file\" (it is \"{}\")",
+                    e.waveform.as_str()
+                ),
+            );
+        }
+        if q.path.get_ref().trim().is_empty() {
+            self.error(q.path.span(), format!("{user}: iq_file.path is empty"));
+        }
+        if let Some(st) = &q.start
+            && st.get_ref().get().as_ps() < 0
+        {
+            self.error(
+                st.span(),
+                format!("{user}: iq_file.start cannot be negative"),
+            );
+        }
+        let r = &q.response;
+        let width_ok = |v: &mut Self, f: &Spanned<Frequency>, what: &str| {
+            v.positive(f, what);
+            if let Some(rate) = &q.sample_rate {
+                let rate = rate.get_ref().get();
+                let scaled = i128::from(f.get_ref().as_micro_hz()) * i128::from(rate.den());
+                if scaled > 1_000_000 * i128::from(rate.num()) {
+                    v.error(
+                        f.span(),
+                        format!("{user}: iq_file {what} exceeds the native sample rate"),
+                    );
+                }
+            }
+        };
+        if let Some(b) = &r.bandwidth {
+            width_ok(self, b, "response bandwidth");
+        }
+        if let Some(st) = &r.stopband {
+            width_ok(self, st, "response stopband");
+        }
+        if let (Some(b), Some(st)) = (&r.bandwidth, &r.stopband)
+            && st.get_ref() <= b.get_ref()
+        {
+            self.error(
+                st.span(),
+                format!("{user}: iq_file response stopband must be wider than its bandwidth"),
+            );
+        }
+        if let Some(a) = &r.attenuation
+            && !(20.0..=200.0).contains(&a.get_ref().db())
+        {
+            self.error(
+                a.span(),
+                format!("{user}: iq_file response attenuation must be 20 to 200 dB"),
+            );
+        }
+    }
+
     fn clock_and_lo(
         &mut self,
         clock: &ClockModelSpec,
@@ -307,6 +380,7 @@ impl Validator {
             let user = format!("emitter \"{}\"", e.name.as_str());
             attachment(self, &e.platform, e.mount.as_ref(), &user);
             self.positive(&e.frequency, "the emitter frequency");
+            self.iq_file(e, &user);
         }
         for r in &s.receivers {
             let user = format!("receiver \"{}\"", r.name.as_str());

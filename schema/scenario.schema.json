@@ -368,6 +368,10 @@
           "description": "Carrier frequency.",
           "$ref": "#/$defs/Frequency"
         },
+        "iq_file": {
+          "description": "The recording an `iq_file` waveform plays (required exactly when\n`waveform = \"iq_file\"`).",
+          "$ref": "#/$defs/IqFileSpec"
+        },
         "mount": {
           "description": "The mount the emitter radiates from (default: the platform origin).",
           "$ref": "#/$defs/Ident"
@@ -385,7 +389,7 @@
           "$ref": "#/$defs/Power"
         },
         "waveform": {
-          "description": "Waveform from the library (placeholder reference).",
+          "description": "Waveform: the built-in `cw`, the built-in `iq_file` (with [`Self::iq_file`]), or\na library reference (not resolved yet).",
           "$ref": "#/$defs/LibraryRef"
         }
       },
@@ -397,6 +401,26 @@
         "power",
         "behavior",
         "waveform"
+      ]
+    },
+    "EndPolicySpec": {
+      "description": "End-of-file behavior of an IQ-file emitter.",
+      "oneOf": [
+        {
+          "description": "The recording must cover the run: rendering past its last sample is an error.",
+          "type": "string",
+          "const": "stop"
+        },
+        {
+          "description": "Silence after the last sample.",
+          "type": "string",
+          "const": "zero_pad"
+        },
+        {
+          "description": "The recording repeats; its last sample is followed directly by its first.",
+          "type": "string",
+          "const": "loop"
+        }
       ]
     },
     "Epoch": {
@@ -442,6 +466,42 @@
       "description": "An entity name or a reference to one: ASCII letters, digits, '_' and '-'.",
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+    },
+    "IqFileSpec": {
+      "description": "An IQ-file emitter: a SigMF ci16_le or cf32_le recording played on the emitter's\ncarrier (contracts §5.6). The emitter `frequency` is the RF frequency of the file's\n0 Hz, and its native rate is the recording's `core:sample_rate`.",
+      "type": "object",
+      "properties": {
+        "end": {
+          "description": "What happens after the last sample.",
+          "$ref": "#/$defs/EndPolicySpec"
+        },
+        "normalization": {
+          "description": "How sample values map to the emitter `power`.",
+          "$ref": "#/$defs/NormalizationSpec"
+        },
+        "path": {
+          "description": "The recording: its `.sigmf-meta` or `.sigmf-data` file, or the common stem,\nrelative to the scenario file unless absolute.",
+          "type": "string"
+        },
+        "response": {
+          "description": "The source reconstruction response (defaults: bandwidth 0.8 × and stopband 1 ×\nthe native rate, 80 dB).",
+          "$ref": "#/$defs/SourceResponseSpec"
+        },
+        "sample_rate": {
+          "description": "The native rate, if stated: it must equal the recording's `core:sample_rate`.",
+          "$ref": "#/$defs/SampleRate"
+        },
+        "start": {
+          "description": "Truth time at which sample 0 is emitted (default 0 s, not negative).",
+          "$ref": "#/$defs/Duration"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "end",
+        "normalization"
+      ]
     },
     "IqSpec": {
       "description": "IQ imbalance and DC offset (receiver chain stage 4).",
@@ -592,6 +652,21 @@
       "required": [
         "name",
         "antenna"
+      ]
+    },
+    "NormalizationSpec": {
+      "description": "Level normalization of an IQ-file emitter.",
+      "oneOf": [
+        {
+          "description": "`power` is the power of a full-scale sample (|x| = 1: cf32 magnitude 1, ci16\nmagnitude 32768).",
+          "type": "string",
+          "const": "full_scale"
+        },
+        {
+          "description": "`power` is the recording's mean power over all its samples.",
+          "type": "string",
+          "const": "rms"
+        }
       ]
     },
     "Platform": {
@@ -898,6 +973,25 @@
           "const": "zmq_preview"
         }
       ]
+    },
+    "SourceResponseSpec": {
+      "description": "The source reconstruction response of an IQ-file emitter (full widths).",
+      "type": "object",
+      "properties": {
+        "attenuation": {
+          "description": "Stopband attenuation (default 80 dB, 20 to 200 dB).",
+          "$ref": "#/$defs/Gain"
+        },
+        "bandwidth": {
+          "description": "Passband full width (default 0.8 × the native rate).",
+          "$ref": "#/$defs/Frequency"
+        },
+        "stopband": {
+          "description": "Stopband full width (default the native rate, at most the native rate).",
+          "$ref": "#/$defs/Frequency"
+        }
+      },
+      "additionalProperties": false
     },
     "Trajectory": {
       "description": "A platform motion model (placeholder).",

@@ -438,3 +438,68 @@ Append one entry per prompt. Newest at the bottom. Each entry covers what was bu
 - Consumer metadata should label the decimation group delay and start-up transient once the receiver-profile prompt pins how a consumer learns about them. Truth already records the delay.
 - AGC is a simple multiplicative loop. A receiver-profile AGC (attack/decay in time constants, dB-domain) may replace it.
 - `ResolvedScenario` is the first canonical "resolved scenario". Library and IQ-file prompts must add their items to it and register assets so replay covers them.
+
+---
+
+## Prompt 6a: IQ-file emitters and CPU resampling (2026-11-09)
+
+**Built**
+
+- **Signal model and resampler (contracts §5.6).** A sampled source is reconstructed by φ, a zero-phase member of the §5.1 family (new tap kind `SourceReconstruction`, code 3). Each target sees `z = x ∗ K`, where `K = φ ∗ h` shifted to the carrier offset (spectrum Φ(f)·H(f + Δf), including H's group delay). The carrier phase polynomial does the frequency translation at the target rate, so a low native rate never translates its own samples.
+  - **Stage 1** (`iqsim-waveform::continuous`, control plane, f64, fixed order): K comes from its frequency integral (Gauss–Legendre, convergence by doubling), is truncated to supp φ + supp h, and is evaluated on U = 2^j points per native sample. U is the smallest that keeps a 6-tap Lagrange interpolator within 2·10⁻⁶ at the highest frequency z can contain. Windows are pure functions of the grid index, so block splits agree bit for bit.
+  - **Stage 2** (`iqsim-render::farrow_value`, f32): 6-tap quintic Lagrange Farrow with a fixed coefficient table and operation order, recorded for the CUDA port.
+- `iqsim-worklist`: `EMISSION_CONTINUOUS`, `ContinuousEmission`, `SourceWindowHeader` and `SourceWindowArena` (a new `BlockWorkList::continuous` and `windows`). `validate()` checks native units and that every Farrow tap lies inside the window. `content_hash` covers the windows.
+- `iqsim-runtime::static_scene`: `StaticWaveform::Continuous` (`ContinuousSpec`, `SharedSource`). Kernels are cached by `ResampleKey`. Per block:
+  - the native coordinate is exact at k = 0 (Q64.64 instant × rational rate in i128, τ rounded once);
+  - links that share a source, kernel and start share one window;
+  - coordinates are rebased to the window origin;
+  - the level factor applied in stage 1 (f64), the `stop` exhaustion check over the samples the run keeps, the window-size limit, lossless pre-filter culling, and the headroom bound from the window peak times the Farrow Lebesgue constant.
+- `iqsim-io::iq_input` (written by Codex CLI to my spec, reviewed, unchanged): SigMF metadata validation, one streaming pass (SHA-256, per-page hashes, peak, Σ|x|², optional `core:sha512`), and an LRU page-cache reader that re-verifies each page on load.
+- `iqsim-contracts`: `AssetRegistry::register_digest` / `verify_digests`, so large files are hashed and verified without loading them.
+- `iqsim-scenario`: `Emitter.iq_file` (`IqFileSpec`, `EndPolicySpec`, `NormalizationSpec`, `SourceResponseSpec`) and lint rules. Schema regenerated.
+- `iqsim-runtime::plan` / `offline`:
+  - `resolve(scenario, base_dir)` opens the recording and records exact rate, N, start, policy, normalization factor, φ and both file hashes in the resolved scenario. CW emitters serialize as before.
+  - `RunPlan::new` reopens the recording and requires the same hashes.
+  - The manifest registers `<emitter>.data` and `<emitter>.meta` as `iq_input` assets. Replay verifies them by streamed digest before anything else.
+  - Truth gains an `iq_file` entry per IQ-file link (CW link records are unchanged).
+- `examples/iq_file.toml` with `examples/iq/chirp_2msps.sigmf-{meta,data}` (10 ms ci16 chirp + tone, regenerated and compared by a test). `sim lint`, `sim run --offline` and `sim replay` work on it, and a flipped data byte makes replay fail.
+- Tests: waveform 5, render 1, worklist 1, scenario 2, Codex's io 17, and 16 in `crates/iqsim-runtime/tests/iq_file.rs` (4 of them review regressions). Measured on both taps (16 MS/s channel at 1090 MHz, 2 MS/s source at +5 MHz):
+  - **Frequency and level:** four tones from −0.65 to +0.7 MHz: level within 3.5·10⁻⁷ dB of Friis·|Φ|·|H| (bound 0.1 dB), frequency within 3·10⁻¹⁰ Hz (bound 1 Hz).
+  - **No native-rate images:** every 2 MHz image inside the band ≤ 1.6·10⁻⁸ of the tone (bound 10⁻⁴).
+  - **Fractional delay:** a chirp at two start offsets against an independent direct sum whose kernel is a time-domain Simpson convolution of the test's own sinc·Gaussian responses: ≤ 2.2·10⁻⁷ of peak (bound 2·10⁻⁵), envelope delay ≤ 7.8·10⁻⁷ samples (bound 10⁻³).
+  - **Out of band:** a 1030 MHz IQ emitter is culled, and is exactly zero with culling off. A straddling source at +8 MHz: the 7.3 MHz component matches |H| within 5·10⁻⁷ dB, and the would-be −7.3 MHz alias is ≤ 2·10⁻¹⁷ (rx) and 5·10⁻¹⁵ (port) of the unfiltered level.
+  - **Port power through SigMF**, ci16 and cf32, `full_scale` and `rms`: within 10⁻⁴ dB of the link budget.
+  - **Determinism:** identical across 1/2/8 threads and chunk lengths 1 and 777; blocks of 16 000, 4000 and 1777 samples are bit-identical sample for sample (the test allows 10⁻⁶); `loop` repeats bit for bit every period; `zero_pad` is exactly empty after the tail; `stop` fails the block (and the run) that outlasts the file.
+  - **Replay and inputs:** a changed IQ byte, a changed meta file and a missing data file are rejected before rendering. Truncated, `ci16_be`, NaN, mismatched-rate and missing recordings are rejected at resolution.
+  - **Golden:** new `runtime/iq_file_rx_ch0`, `runtime/iq_file_port`, `runtime/iq_file_truth`, blessed for the first time. No existing golden changed.
+
+**Decisions and deviations**
+
+- **End policy `stop`** is strict, decided with the user: the recording must cover the run, and a block whose retarded coordinate passes the last sample fails. `zero_pad` is silence afterwards, and `loop` repeats with the last sample followed directly by the first. Before `start`, every policy is silent. Offline runs render the last block whole, but the check covers only the samples the run keeps.
+- **Stage 1 runs on the control plane in f64**, not f32 on the render path. Only the Farrow interpolation is a render kernel. Stage 1 computes at U·F_n, which is wasteful when the native rate far exceeds the target band; a decimating stage 1 is phase 7 performance work.
+- **"Filter history"** is recomputed: every window reads its own halo from the immutable source, instead of a carried state handed off between blocks. This is deterministic and split-invariant by construction, like the receiver noise in prompt 6.
+- **Level normalization** is explicit and required: `full_scale` or `rms` (Σ|x|²/N over the whole file in f64, file order). The factor is applied in stage 1 in f64, not in the f32 amplitude. The headroom bound uses the actual window peak, not a declared crest factor.
+- **Native rate** comes from `core:sample_rate` via its shortest round-trip decimal, parsed exactly. A scenario `sample_rate` is an assertion, not an override.
+- **φ's tap kind:** φ is not a tap, but `TapKind` gained a third code so the response machinery and identity hashing could be reused unchanged.
+- **Recordings are read three times** at run start (resolution, plan and, on replay, verification). This is simple and correct. Passing the opened input through is a later optimization.
+
+**Independent review (Codex CLI, `high` reasoning, read-only, about 20 minutes)**
+
+- Codex also wrote `iqsim-io::iq_input` to my spec (workspace-write, limited to that crate). I reviewed it before wiring it in and changed nothing.
+- The review reproduced five issues with scratch programs. All are fixed, each with a regression test. No golden changed.
+  - **P1, RMS silence.** A 10⁻³⁰ recording with an RMS factor of 10³⁰ was culled: the window peak was computed from f32 squares, which underflowed, and the factor sat in the f32 amplitude. The factor is now applied in stage 1 (f64), and the window peak is computed in f64 and rounded up to an f32 bound.
+  - **P1, wrapping coordinate.** `validate()` checked wrapped endpoints only, so a huge linear slope could wrap mod 2¹²⁸ back into the window and then index outside it in the Farrow kernel (a panic). It now requires `D0 + (len − 1)·D1` to fit in i128. This also closes the same gap for pulse coordinates.
+  - **P2, end policy missing from window grouping.** Two links on one source with `zero_pad` and `loop` shared the first link's policy. The grouping key now includes the timeline (length, policy) and the level factor.
+  - **P2, window size checked too late.** An oversized window (e.g. a 16 MS/s source in 4.8 M-sample blocks, 77 M points) was allocated and filtered before the 2²⁶ limit rejected it. It is now `WindowTooLong` before any allocation.
+  - **P2, `stop` and a final partial block.** The check covered the discarded tail of the last block, so a 1 ms run in 20 ms blocks rejected a 10 ms recording. `StaticSceneBuilder::with_sample_limit`, set by the offline runner, limits the check to the kept samples.
+
+**Dependencies**
+
+- No new external crates. `sha2::Sha512` (already vendored) is used by `iqsim-io` for `core:sha512`. No internal dependency edges were added: the runtime adapts the io reader to the waveform trait. `cargo xtask deps` passes.
+
+**Open questions**
+
+- Multipath (phase 8) will put several paths on one window. Grouping by (source, kernel, start) already supports it, but the window then covers the union of their delays.
+- Moving geometry (phase 3) makes the coordinate cubic. `validate()` must then bound the coordinate's interior (as for pulses), and the window must cover the extremum.
+- For live or generated continuous sources, stage-1 lookahead (supp K + 3 cells) must enter the commit boundary's filter lookahead (§4).
+- A recording whose content reaches native Nyquist is attenuated by φ's transition (0.8–1.0 × rate by default). That is the model, not an error, but users replaying full-band captures may want a wider φ.

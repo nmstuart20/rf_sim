@@ -1,0 +1,1 @@
+{"annotations":[],"captures":[{"core:frequency":1092000000.0,"core:sample_start":0}],"global":{"core:datatype":"ci16_le","core:description":"iqsim example: 10 ms, chirp ±0.6 MHz at 0.5 FS plus a 0.25 MHz tone at 0.25 FS","core:sample_rate":2000000.0,"core:version":"1.2.0"}}

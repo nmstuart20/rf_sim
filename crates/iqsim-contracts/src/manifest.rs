@@ -255,6 +255,65 @@ impl AssetRegistry {
         }
     }
 
+    /// Registers an asset whose length and SHA-256 were computed by a streaming pass
+    /// (large files), with the same conflict rule as [`Self::register`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_digest(
+        &mut self,
+        kind: AssetKind,
+        logical_name: &str,
+        path: &str,
+        byte_len: u64,
+        sha256: [u8; 32],
+        format: &str,
+        metadata: Option<&Value>,
+    ) -> Result<(), AssetMismatch> {
+        let record = AssetRecord {
+            kind,
+            logical_name: logical_name.to_owned(),
+            resolved_path: path.to_owned(),
+            byte_len,
+            sha256: hex::encode(sha256),
+            format: format.to_owned(),
+            metadata_sha256: metadata.map(canonical_sha256),
+        };
+        self.insert(record)
+    }
+
+    fn insert(&mut self, record: AssetRecord) -> Result<(), AssetMismatch> {
+        let key = (record.kind, record.logical_name.clone());
+        match self.assets.get(&key) {
+            Some(existing) if *existing != record => Err(AssetMismatch::Conflict {
+                logical_name: record.logical_name,
+            }),
+            Some(_) => Ok(()),
+            None => {
+                self.assets.insert(key, record);
+                Ok(())
+            }
+        }
+    }
+
+    /// Checks every record against the (length, SHA-256) that `digest` computes for its
+    /// path, so large files can be verified without holding them in memory.
+    pub fn verify_digests<E: fmt::Display>(
+        records: &[AssetRecord],
+        mut digest: impl FnMut(&str) -> Result<(u64, [u8; 32]), E>,
+    ) -> Result<(), AssetMismatch> {
+        for r in records {
+            let (len, sha) = digest(&r.resolved_path).map_err(|e| AssetMismatch::Missing {
+                logical_name: r.logical_name.clone(),
+                error: e.to_string(),
+            })?;
+            if len != r.byte_len || hex::encode(sha) != r.sha256 {
+                return Err(AssetMismatch::Changed {
+                    logical_name: r.logical_name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The records, in (kind, name) order.
     pub fn records(&self) -> Vec<AssetRecord> {
         self.assets.values().cloned().collect()

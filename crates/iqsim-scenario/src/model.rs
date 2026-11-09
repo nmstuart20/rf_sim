@@ -247,8 +247,76 @@ pub struct Emitter {
     pub power: Power,
     /// Behavior from the library (placeholder reference).
     pub behavior: LibraryRef,
-    /// Waveform from the library (placeholder reference).
+    /// Waveform: the built-in `cw`, the built-in `iq_file` (with [`Self::iq_file`]), or
+    /// a library reference (not resolved yet).
     pub waveform: LibraryRef,
+    /// The recording an `iq_file` waveform plays (required exactly when
+    /// `waveform = "iq_file"`).
+    pub iq_file: Option<IqFileSpec>,
+}
+
+/// An IQ-file emitter: a SigMF ci16_le or cf32_le recording played on the emitter's
+/// carrier (contracts §5.6). The emitter `frequency` is the RF frequency of the file's
+/// 0 Hz, and its native rate is the recording's `core:sample_rate`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IqFileSpec {
+    /// The recording: its `.sigmf-meta` or `.sigmf-data` file, or the common stem,
+    /// relative to the scenario file unless absolute.
+    #[schemars(with = "String")]
+    pub path: Spanned<String>,
+    /// Truth time at which sample 0 is emitted (default 0 s, not negative).
+    #[schemars(with = "Option<Duration>")]
+    pub start: Option<Spanned<Duration>>,
+    /// What happens after the last sample.
+    pub end: EndPolicySpec,
+    /// How sample values map to the emitter `power`.
+    pub normalization: NormalizationSpec,
+    /// The native rate, if stated: it must equal the recording's `core:sample_rate`.
+    #[schemars(with = "Option<SampleRate>")]
+    pub sample_rate: Option<Spanned<SampleRate>>,
+    /// The source reconstruction response (defaults: bandwidth 0.8 × and stopband 1 ×
+    /// the native rate, 80 dB).
+    #[serde(default)]
+    pub response: SourceResponseSpec,
+}
+
+/// End-of-file behavior of an IQ-file emitter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EndPolicySpec {
+    /// The recording must cover the run: rendering past its last sample is an error.
+    Stop,
+    /// Silence after the last sample.
+    ZeroPad,
+    /// The recording repeats; its last sample is followed directly by its first.
+    Loop,
+}
+
+/// Level normalization of an IQ-file emitter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizationSpec {
+    /// `power` is the power of a full-scale sample (|x| = 1: cf32 magnitude 1, ci16
+    /// magnitude 32768).
+    FullScale,
+    /// `power` is the recording's mean power over all its samples.
+    Rms,
+}
+
+/// The source reconstruction response of an IQ-file emitter (full widths).
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceResponseSpec {
+    /// Passband full width (default 0.8 × the native rate).
+    #[schemars(with = "Option<Frequency>")]
+    pub bandwidth: Option<Spanned<Frequency>>,
+    /// Stopband full width (default the native rate, at most the native rate).
+    #[schemars(with = "Option<Frequency>")]
+    pub stopband: Option<Spanned<Frequency>>,
+    /// Stopband attenuation (default 80 dB, 20 to 200 dB).
+    #[schemars(with = "Option<Gain>")]
+    pub attenuation: Option<Spanned<Gain>>,
 }
 
 /// A virtual receiver: an antenna on a platform feeding one or more channels.

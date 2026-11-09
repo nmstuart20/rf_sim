@@ -8,8 +8,13 @@
 //!   taken as heights above the ellipsoid, because there is no geoid or terrain model
 //!   yet (phases 3 and 8). Flight levels are rejected until the Mode C altitude chain.
 //!   Mounts are ignored: antennas are isotropic at the platform origin.
-//! - Emitters must use the built-in `waveform = "cw"` and `behavior = "always_on"`.
-//!   Library resolution comes later.
+//! - Emitters must use `behavior = "always_on"` and the built-in `waveform = "cw"` or
+//!   `waveform = "iq_file"`. Library resolution comes later.
+//! - An `iq_file` path is relative to the scenario file. Resolution opens the recording
+//!   (one streaming pass: validation, hashes, peak and mean power) and records its
+//!   native rate (the shortest decimal of `core:sample_rate`, parsed exactly), length,
+//!   start, end policy, normalization factor, reconstruction response and the SHA-256
+//!   of both files, so a changed recording changes the resolved hash.
 //! - Each receiver channel is one virtual-receiver stream (`<receiver>.<channel>`), and
 //!   each antenna port one antenna-port stream (`<port>`). Only SigMF sinks are written.
 //! - A response's passband edge is `bandwidth / 2` and its stopband edge `stopband / 2`
@@ -20,6 +25,7 @@
 //!   SHA-256(`"iqsim.entity.v1\0"` ‖ name), so they do not depend on file order.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use iqsim_core::amplitude::{LOSSLESS_CULL_LSB, rms_volts};
 use iqsim_core::{
@@ -27,16 +33,27 @@ use iqsim_core::{
     TargetScale, TruthTime,
 };
 use iqsim_geo::Ecef;
+use iqsim_io::iq_input::IqInput;
 use iqsim_receiver::{
     AdcConfig, AgcConfig, ChainConfig, DecimationConfig, FrontEnd, IqImpairment, LoConfig,
     NoiseConfig, OutputFormat, PhaseNoise,
 };
-use iqsim_scenario::{ClockModel, LoModel, ResponseDetail, SampleFormatSpec, Scenario, SinkKind};
+use iqsim_scenario::{
+    ClockModel, EndPolicySpec, IqFileSpec, LoModel, NormalizationSpec, ResponseDetail,
+    SampleFormatSpec, Scenario, SinkKind,
+};
 use iqsim_units::{AltitudeRef, Frequency, Position};
+use iqsim_waveform::continuous::source_response;
+use iqsim_waveform::{EndPolicy, SourceTimeline};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::static_scene::{StaticEmitter, StaticScene, StaticTarget, StaticWaveform};
+use crate::static_scene::{
+    ContinuousSpec, SharedSource, StaticEmitter, StaticScene, StaticTarget, StaticWaveform,
+};
+
+/// Pages an IQ-file reader may cache (64 MiB at 1 MiB per page).
+pub const IQ_CACHE_PAGES: usize = 64;
 
 /// Default block length, ps (1 ms).
 pub const DEFAULT_BLOCK_PS: i64 = 1_000_000_000;
@@ -162,8 +179,160 @@ pub struct ResolvedEmitter {
     pub carrier_uhz: i64,
     /// Power, W.
     pub power_w: f64,
-    /// Built-in waveform.
+    /// Built-in waveform: `cw` or `iq_file`.
     pub waveform: String,
+    /// The recording of an `iq_file` emitter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<ResolvedIqSource>,
+}
+
+/// A resolved IQ-file source.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResolvedIqSource {
+    /// Absolute path of the `.sigmf-meta` file.
+    pub meta_path: String,
+    /// Absolute path of the `.sigmf-data` file.
+    pub data_path: String,
+    /// `ci16_le` or `cf32_le`.
+    pub datatype: String,
+    /// Native rate numerator.
+    pub rate_num: u64,
+    /// Native rate denominator.
+    pub rate_den: u64,
+    /// Complex samples N.
+    pub sample_count: u64,
+    /// Emission time of sample 0, ps.
+    pub start_ps: i64,
+    /// `stop`, `zero_pad` or `loop`.
+    pub end: String,
+    /// `full_scale` or `rms`.
+    pub normalization: String,
+    /// Factor applied to the normalized samples (1, or 1/RMS).
+    pub scale: f64,
+    /// max |x| of the normalized samples.
+    pub peak: f64,
+    /// Source reconstruction response φ.
+    pub response: ResolvedResponse,
+    /// Data file length, bytes.
+    pub data_byte_len: u64,
+    /// SHA-256 of the data file.
+    pub data_sha256: String,
+    /// Metadata file length, bytes.
+    pub meta_byte_len: u64,
+    /// SHA-256 of the metadata file.
+    pub meta_sha256: String,
+}
+
+/// The `.sigmf-meta` and `.sigmf-data` paths for a scenario `iq_file.path`.
+fn recording_paths(base: &Path, text: &str) -> (PathBuf, PathBuf) {
+    let stem = text
+        .strip_suffix(".sigmf-meta")
+        .or_else(|| text.strip_suffix(".sigmf-data"))
+        .unwrap_or(text);
+    let stem = base.join(stem);
+    let with = |ext: &str| {
+        let mut p = stem.clone().into_os_string();
+        p.push(ext);
+        PathBuf::from(p)
+    };
+    (with(".sigmf-meta"), with(".sigmf-data"))
+}
+
+/// The exact rate a SigMF `core:sample_rate` names: its shortest round-trip decimal,
+/// parsed as an exact quantity.
+fn exact_rate(hz: f64, owner: &str) -> Result<SampleRate, ResolveError> {
+    let text = format!("{hz} S/s");
+    text.parse::<iqsim_units::SampleRate>()
+        .map(|r| r.get())
+        .map_err(|e| ResolveError(format!("{owner}: core:sample_rate {hz}: {e}")))
+}
+
+fn resolve_iq(q: &IqFileSpec, base: &Path, owner: &str) -> Result<ResolvedIqSource, ResolveError> {
+    let (meta, data) = recording_paths(base, q.path.get_ref());
+    let canon = |p: &Path| {
+        std::fs::canonicalize(p).map_err(|e| ResolveError(format!("{owner}: {}: {e}", p.display())))
+    };
+    let (meta, data) = (canon(&meta)?, canon(&data)?);
+    let input = IqInput::open(&meta, &data).map_err(|e| ResolveError(format!("{owner}: {e}")))?;
+    let m = input.meta();
+    let sum = input.summary();
+    let rate = exact_rate(m.sample_rate_hz, owner)?;
+    if let Some(stated) = &q.sample_rate
+        && stated.get_ref().get() != rate
+    {
+        return err(format!(
+            "{owner}: iq_file.sample_rate {} differs from the recording's {}",
+            stated.get_ref(),
+            iqsim_units::SampleRate::new(rate)
+        ));
+    }
+    let rate_uhz = rate_uhz(rate);
+    let r = &q.response;
+    let bw = r
+        .bandwidth
+        .as_ref()
+        .map_or(rate_uhz / 5 * 4, |b| b.get_ref().as_micro_hz());
+    let stop = r
+        .stopband
+        .as_ref()
+        .map_or(rate_uhz, |b| b.get_ref().as_micro_hz());
+    let atten = match &r.attenuation {
+        Some(a) => {
+            let mdb = libm::round(a.get_ref().db() * 1000.0);
+            if !(20_000.0..=200_000.0).contains(&mdb) {
+                return err(format!("{owner}: attenuation must be 20 to 200 dB"));
+            }
+            mdb as u32
+        }
+        None => DEFAULT_ATTENUATION_MDB,
+    };
+    let response = ResolvedResponse {
+        passband_edge_uhz: bw / 2,
+        stopband_edge_uhz: stop / 2,
+        stopband_atten_mdb: atten,
+        group_delay_ps: 0,
+    };
+    source_response(rate, response.spec())
+        .map_err(|e| ResolveError(format!("{owner}: iq_file response: {e}")))?;
+    let scale = match q.normalization {
+        NormalizationSpec::FullScale => 1.0,
+        NormalizationSpec::Rms => {
+            let mean = sum.sum_power / sum.sample_count as f64;
+            if mean.is_nan() || mean <= 0.0 {
+                return err(format!(
+                    "{owner}: an all-zero recording cannot be RMS-normalized"
+                ));
+            }
+            1.0 / mean.sqrt()
+        }
+    };
+    Ok(ResolvedIqSource {
+        meta_path: meta.display().to_string(),
+        data_path: data.display().to_string(),
+        datatype: m.datatype.name().to_owned(),
+        rate_num: rate.num(),
+        rate_den: rate.den(),
+        sample_count: sum.sample_count,
+        start_ps: q.start.as_ref().map_or(0, |s| s.get_ref().get().as_ps()),
+        end: match q.end {
+            EndPolicySpec::Stop => "stop",
+            EndPolicySpec::ZeroPad => "zero_pad",
+            EndPolicySpec::Loop => "loop",
+        }
+        .to_owned(),
+        normalization: match q.normalization {
+            NormalizationSpec::FullScale => "full_scale",
+            NormalizationSpec::Rms => "rms",
+        }
+        .to_owned(),
+        scale,
+        peak: sum.peak_magnitude,
+        response,
+        data_byte_len: sum.byte_len,
+        data_sha256: hex::encode(sum.sha256),
+        meta_byte_len: m.meta_byte_len,
+        meta_sha256: hex::encode(m.meta_sha256),
+    })
 }
 
 /// One resolved output stream (a tap of a channel).
@@ -353,8 +522,9 @@ fn platform_position(
     ecef(&p.position, owner)
 }
 
-/// Resolves a parsed, lint-clean scenario.
-pub fn resolve(scenario: &Scenario) -> Result<ResolvedScenario, ResolveError> {
+/// Resolves a parsed, lint-clean scenario. Relative input paths are taken from
+/// `base`, the scenario file's directory.
+pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, ResolveError> {
     let Some(render) = &scenario.render else {
         return err("`sim run` needs a [render] table with a duration");
     };
@@ -370,17 +540,28 @@ pub fn resolve(scenario: &Scenario) -> Result<ResolvedScenario, ResolveError> {
     let mut emitters = Vec::new();
     for e in &scenario.emitters {
         let owner = format!("emitter \"{}\"", e.name.as_str());
-        if e.waveform.as_str() != "cw" || e.behavior.as_str() != "always_on" {
+        let waveform = e.waveform.as_str();
+        if !matches!(waveform, "cw" | "iq_file") || e.behavior.as_str() != "always_on" {
             return err(format!(
-                "{owner}: only the built-in waveform \"cw\" with behavior \"always_on\" is available so far"
+                "{owner}: only the built-in waveforms \"cw\" and \"iq_file\" with behavior \"always_on\" are available so far"
             ));
         }
+        let source = match (&e.iq_file, waveform) {
+            (Some(q), "iq_file") => Some(resolve_iq(q, base, &owner)?),
+            (None, "cw") => None,
+            _ => {
+                return err(format!(
+                    "{owner}: iq_file must be given exactly for waveform \"iq_file\""
+                ));
+            }
+        };
         emitters.push(ResolvedEmitter {
             name: e.name.as_str().to_owned(),
             position_ecef_m: platform_position(scenario, e.platform.as_str(), &owner)?,
             carrier_uhz: e.frequency.get_ref().as_micro_hz(),
             power_w: e.power.watts(),
-            waveform: "cw".to_owned(),
+            waveform: waveform.to_owned(),
+            source,
         });
     }
 
@@ -633,10 +814,13 @@ pub struct RunPlan {
 impl RunPlan {
     /// Builds runtime objects from a resolved scenario.
     pub fn new(resolved: ResolvedScenario) -> Result<Self, ResolveError> {
-        let emitters: Vec<StaticEmitter> = resolved
-            .emitters
-            .iter()
-            .map(|e| StaticEmitter {
+        let mut emitters: Vec<StaticEmitter> = Vec::new();
+        for e in &resolved.emitters {
+            let waveform = match &e.source {
+                None => StaticWaveform::Cw,
+                Some(src) => StaticWaveform::Continuous(open_source(src, &e.name)?),
+            };
+            emitters.push(StaticEmitter {
                 position: Ecef::new(
                     e.position_ecef_m[0],
                     e.position_ecef_m[1],
@@ -644,9 +828,9 @@ impl RunPlan {
                 ),
                 carrier_uhz: e.carrier_uhz,
                 power_w: e.power_w,
-                waveform: StaticWaveform::Cw,
-            })
-            .collect();
+                waveform,
+            });
+        }
         let mut streams = Vec::new();
         for s in &resolved.streams {
             let owner = format!("stream \"{}\"", s.id);
@@ -696,6 +880,59 @@ impl RunPlan {
         }
         Ok(Self { resolved, streams })
     }
+}
+
+/// The [`iqsim_waveform::ContinuousSource`] view of an IQ-file reader.
+struct IqFileSource {
+    len: u64,
+    reader: iqsim_io::iq_input::IqFileReader,
+}
+
+impl iqsim_waveform::ContinuousSource for IqFileSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn fill(&mut self, first: u64, out: &mut [[f64; 2]]) -> Result<(), String> {
+        self.reader.read(first, out).map_err(|e| e.to_string())
+    }
+}
+
+/// Opens a resolved IQ-file source for rendering. The recording must still be the one
+/// resolution hashed.
+fn open_source(src: &ResolvedIqSource, name: &str) -> Result<ContinuousSpec, ResolveError> {
+    let owner = format!("emitter \"{name}\"");
+    let input = IqInput::open(Path::new(&src.meta_path), Path::new(&src.data_path))
+        .map_err(|e| ResolveError(format!("{owner}: {e}")))?;
+    if hex::encode(input.summary().sha256) != src.data_sha256
+        || hex::encode(input.meta().meta_sha256) != src.meta_sha256
+    {
+        return err(format!(
+            "{owner}: the recording changed since it was resolved"
+        ));
+    }
+    let rate = SampleRate::from_ratio(src.rate_num, src.rate_den)
+        .map_err(|e| ResolveError(format!("{owner}: {e}")))?;
+    let policy = match src.end.as_str() {
+        "stop" => EndPolicy::Stop,
+        "zero_pad" => EndPolicy::ZeroPad,
+        "loop" => EndPolicy::Loop,
+        other => return err(format!("{owner}: unknown end policy {other}")),
+    };
+    Ok(ContinuousSpec {
+        source: SharedSource::new(IqFileSource {
+            len: src.sample_count,
+            reader: input.reader(IQ_CACHE_PAGES),
+        }),
+        timeline: SourceTimeline {
+            len: src.sample_count,
+            policy,
+        },
+        rate,
+        start: TruthTime::from_ps(src.start_ps),
+        response: src.response.spec(),
+        scale: src.scale,
+        peak: src.peak,
+    })
 }
 
 fn chain_config(

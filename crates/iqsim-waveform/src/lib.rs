@@ -7,6 +7,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod continuous;
 pub mod edge;
 
+pub use continuous::{
+    ContinuousError, ContinuousSource, EndPolicy, MemorySource, ResampleKernel, ResampleKey,
+    SourceTimeline,
+};
 pub use edge::{BuiltEdgeTable, EdgeError, EdgeShape, EdgeTableKey, build_edge_table};
