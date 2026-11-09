@@ -6,6 +6,7 @@ use iqsim_core::{
     MAX_RATE_HZ, MAX_RATE_NUM, PS_PER_SECOND, SampleIndex, SampleRate, TimeError, TruthTime,
 };
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 /// Cases per property when `PROPTEST_CASES` is not set.
 const DEFAULT_CASES: u32 = 2048;
@@ -14,7 +15,15 @@ const DEFAULT_CASES: u32 = 2048;
 /// setting (including `PROPTEST_RNG_SEED`) comes from proptest's environment defaults.
 /// Failing cases are saved under `proptest-regressions/`; commit those files.
 fn config() -> ProptestConfig {
-    let mut config = ProptestConfig::default();
+    let mut config = ProptestConfig {
+        // Integration tests have no lib.rs beside them, so proptest's default
+        // source-relative persistence silently saves nothing. Use an explicit path
+        // (relative to the crate directory, where cargo runs tests).
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+            "proptest-regressions/timebase_props.txt",
+        ))),
+        ..ProptestConfig::default()
+    };
     if std::env::var_os("PROPTEST_CASES").is_none() {
         config.cases = DEFAULT_CASES;
     }

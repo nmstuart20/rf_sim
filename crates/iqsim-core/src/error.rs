@@ -49,3 +49,46 @@ impl fmt::Display for TimeError {
 }
 
 impl std::error::Error for TimeError {}
+
+/// Failure of a fixed-point, polynomial or float → integer conversion.
+///
+/// Wrapping is part of the definition only for carrier phase and polynomial registers
+/// (contracts §1.1). Every other range violation is reported here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NumericError {
+    /// A floating-point input was NaN or ±Inf (contracts §1.4).
+    NonFinite,
+    /// A value does not fit its fixed-point or integer destination after rounding.
+    OutOfRange,
+    /// A block polynomial length was zero or above [`MAX_BLOCK_LEN`](crate::MAX_BLOCK_LEN).
+    BlockLength {
+        /// The rejected length.
+        len: u64,
+    },
+    /// A local sample index was not inside the polynomial's block.
+    IndexOutsideBlock {
+        /// The requested local index.
+        k: u64,
+        /// The block length.
+        len: u64,
+    },
+}
+
+impl fmt::Display for NumericError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFinite => f.write_str("floating-point value is NaN or infinite"),
+            Self::OutOfRange => f.write_str("value is outside the destination range"),
+            Self::BlockLength { len } => write!(
+                f,
+                "block polynomial length {len} is outside 1..={}",
+                crate::MAX_BLOCK_LEN
+            ),
+            Self::IndexOutsideBlock { k, len } => {
+                write!(f, "local index {k} is outside the block [0, {len})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NumericError {}

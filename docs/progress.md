@@ -89,3 +89,71 @@ Append one entry per prompt. Newest at the bottom. Each entry covers what was bu
 **Open questions**
 
 - `SampleRate` rejects rates above 1 GS/s. A wider-band future emitter source would need the bounds and proof revisited.
+
+---
+
+## Prompt 2: Fixed-point delay, carrier phase, polynomials and sin/cos (2026-11-08)
+
+**Built** (all in `iqsim-core`, written so the CUDA backend can port it line by line)
+
+- `wide` (public module): `U128 {hi, lo}` with wrapping add, sub, neg, `× u64` and `u64 × u64 → U128`. It is built only from `mul_hi_u64` (four 32 × 32 products), wrapping 64-bit multiply, `add_with_carry` and `sub_with_borrow`. It never uses native u128 arithmetic. Native conversions exist for host construction and tests.
+- `fixed`:
+  - `Delay` (Q32.32 samples in i64, range-checked, no arithmetic operators) and `Phase` (u64 cycle fraction, wrapping add/sub).
+  - Ties-to-even float → integer helpers: `f64_to_i64_ties_even`, `f32_to_i64_ties_even`, `require_finite_*`.
+  - Exact f64 → 128-bit fixed conversions: checked for delay, mod one cycle via the exact `x − trunc(x)` for phase.
+- `poly`:
+  - `BlockPoly<T>` with `DelayPoly`/`PhasePoly` aliases. Newton-form D0..D3 128-bit registers (Q32.96 for delay, 0.128 cycle for phase).
+  - `jump(k)`, `eval(k)`, and `cursor(k)` → `PolyCursor::step()` (three wrapping adds).
+  - Exact u64 `binomials(k)`. `MAX_BLOCK_LEN = 4 801 281`.
+- `trig`:
+  - `sincos(Phase) -> (f32, f32)`: 10-bit table index, 24-bit remainder, cubic sin δ / quadratic cos δ correction, every f32 op explicit.
+  - `SIN_TABLE` (1024 × f32) is built at compile time by an integer-only Taylor routine in Q2.62 with explicit ties-to-even f32 rounding and quarter-wave symmetry. No float library is used.
+- `offset`: `OffsetFrequency` (i64, 2⁻³² Hz) and `phase_at(AcqInstant)`. It computes the exact ⌊F·T/(2⁴⁴·5¹²)⌋ mod 2⁶⁴ with a 192-bit product, a shift, and division by 5¹² over 32-bit digits, all in u64 arithmetic.
+- `NumericError` (non-finite, out of range, block length, index outside block).
+- Tests: 23 new unit tests, 15 in `tests/numeric_props.rs` and 4 goldens in `tests/numeric_golden.rs`.
+  - Primitives and `U128` against native u128/i128 (proptest).
+  - Jump against a native reference at random k, and step against jump from random k0 (arbitrary wrapping registers).
+  - Every k of full blocks: 61 440 and 250 000 samples, delay and phase, plus one block of `MAX_BLOCK_LEN` samples.
+  - A phase polynomial that wraps more than 20 000 times per block.
+  - A negative delay rate: strictly decreasing, crossing zero.
+  - Realistic delay-quantization error, measured 1.0 LSB worst case.
+  - Ties-to-even and range boundaries, and non-finite rejection on every constructor.
+  - Offset phase:
+    - against an independent bit-serial bignum reference
+    - additivity in t (|t| up to 104 days) and in Δf
+    - φ(100 days + δ) = φ(δ) exactly for whole-Hz offsets
+    - closed-form values, the floor of tiny negative phases, and extreme inputs
+  - sincos:
+    - table correctly rounded (against f64), symmetric, and no entry near a rounding tie
+    - exact quadrant points
+    - a 2²⁴-point sweep of the top 24 bits with random low bits. **Max abs error: sin 5.98·10⁻⁸, cos 5.97·10⁻⁸** (target 3·10⁻⁷).
+  - Goldens, each 10⁶ evaluations except the table: `core/sincos_table`, `core/sincos_1e6`, `core/block_poly_1e6` (jump and step, delay and phase) and `core/offset_phase_1e6`. All four were blessed for the first time; no existing golden changed.
+
+**Contracts changed** (`docs/contracts.md`, still version 0: §10 decisions 8–10 remain)
+
+- §10 decisions 3–7 settled: maximum block length and quantization bound; sincos design; subnormals preserved; offset-frequency representation; normalization (R₀ = 50 Ω RMS, S = 40), headroom limit L = 2⁶² (one guard bit), null floor and V_ref definition.
+- Amplitude tolerance, decided with the user. Above the −40 dB floor the bound is 0.01 dB. Below it, the absolute bound is **10⁻⁵·V_ref**, not the proposed 10⁻³·V_ref, which would have been 100× looser just below the floor than just above it. The bound is now continuous.
+- §1.1 now names where intentional wrapping lives and where it is forbidden. §1.4 pins the float → integer and integer → float rules, the subnormal policy, and CPU/CUDA compiler flags (CUDA `--fmad=false -ftz=false -prec-div=true -prec-sqrt=true`, no fast intrinsics). §1.5 and §1.6 describe the implemented sincos and offset-phase algorithms.
+
+**Deviations**
+
+- The headroom guard is L = 2⁶² (the contract text proposed "2⁶⁰ of slack" while also saying "about 3 guard bits", which disagree). One full guard bit is simple to state and still allows 2²² full-scale paths.
+- `MAX_BLOCK_LEN` is enforced by `BlockPoly`, not by `BlockSpec`. `BlockSpec` keeps tiling arbitrary lengths (prompt 1 tests use 2⁴⁰ and 2⁶²). The render configuration must check `block_len ≤ MAX_BLOCK_LEN` when it builds work lists.
+- `OffsetFrequency::phase_at` returns the exact floor. Nothing in prompt 2 consumes it yet; the LO model (prompt 15) and receiver chain will.
+- Fixed a prompt 1 test-infrastructure bug. proptest's default failure persistence finds no `lib.rs` beside `tests/*.rs`, so it printed "failed to find lib.rs" and saved nothing. That silently broke the AGENTS.md rule to commit regression files. Both property files now use `FileFailurePersistence::Direct("proptest-regressions/<file>.txt")`, which I verified writes the file. AGENTS.md notes this for future integration tests.
+
+**Dependencies**
+
+- `iqsim-testkit` is now a dev-dependency of `iqsim-core`, for the goldens. It is an internal crate with no iqsim dependencies, so no cycle forms. There are no new external crates. `libm` is still not needed: the table builder is integer-only and nothing in this prompt computes a control-plane transcendental.
+
+**Open questions**
+
+- The delay polynomial's range check over a block (true delay inside Q32.32) belongs to the geometry fitter (phase 3). Evaluation cannot detect wrap-around.
+- The CUDA backend must embed `SIN_TABLE` bytes exactly. The `core/sincos_table` golden pins them.
+
+**Independent review (Codex CLI)**
+
+- The first run, at `xhigh` reasoning, stalled after about 1.5 hours with no output for 80 minutes, and I stopped it. Before stalling it had confirmed the 128-bit primitives, the Newton jump/step identity and the offset-phase division, with all 71 core tests passing. It also raised two issues, both fixed:
+  - The quantization bound was stated as "within 1.5 LSB". The exact worst case at `MAX_BLOCK_LEN` is 1.5 + 2⁻²¹ LSB, so the bound now reads < 2 LSB: 4.7·10⁻¹⁰ samples of delay and 6.9·10⁻¹⁹ rad of phase. Both are still negligible against the budgets.
+  - A true delay just inside −2³¹ samples could be pushed past the range edge by quantization and wrap to nearly `i64::MAX`. I added `DELAY_RANGE_MARGIN_LSB = 2`. Contracts §1.3 now requires the geometry fitter to keep the true delay that far inside the Q32.32 range.
+- A second, narrower run at `high` reasoning covered `fixed.rs` and `trig.rs`. It found no implementation bugs (ties, range checks, wrapping, signed zero, table construction, CUDA/FMA portability). It found one wrong comment: a power-of-two-scaled product *can* be subnormal (2⁻¹⁰⁷⁴·2³²). The scaling is still exact, so only the wording changed.

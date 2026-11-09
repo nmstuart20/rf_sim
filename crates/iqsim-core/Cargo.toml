@@ -10,6 +10,7 @@ publish.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+iqsim-testkit.workspace = true
 proptest.workspace = true
 
 [lints]

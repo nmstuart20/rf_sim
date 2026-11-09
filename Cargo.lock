@@ -163,6 +163,7 @@ dependencies = [
 name = "iqsim-core"
 version = "0.1.0"
 dependencies = [
+ "iqsim-testkit",
  "proptest",
  "sha2",
 ]
