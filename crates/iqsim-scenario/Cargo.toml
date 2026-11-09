@@ -10,6 +10,10 @@ publish.workspace = true
 iqsim-core.workspace = true
 iqsim-units.workspace = true
 iqsim-contracts.workspace = true
+serde.workspace = true
+toml.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

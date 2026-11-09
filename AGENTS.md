@@ -42,7 +42,8 @@ crates/iqsim-testkit       test support: golden-hash helper (dev-dependency only
 crates/iqsim-cli           the `sim` binary
 xtask/                     cargo xtask ci | bless | gpu-test | deps
 tests/golden/              checked-in SHA-256 golden files
-schema/                    generated JSON Schemas (checked in)
+schema/                    generated JSON Schemas (checked in; `cargo xtask schema`)
+examples/                  example scenarios (must lint clean)
 docs/                      contracts.md, progress.md
 ```
 
@@ -80,6 +81,7 @@ cargo xtask ci        # fmt check, clippy -D warnings, all tests, rustdoc -D war
 cargo xtask bless     # regenerate golden hashes (IQSIM_BLESS=1); extra args go to cargo test
 cargo xtask gpu-test  # CUDA tests (placeholder until prompt 20)
 cargo xtask deps      # dependency-graph rules only
+cargo xtask schema    # regenerate schema/scenario.schema.json (a test fails while it is stale)
 cargo run -p iqsim-cli -- --help
 ```
 

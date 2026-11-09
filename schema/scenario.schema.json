@@ -1,0 +1,667 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Scenario",
+  "description": "A scenario file.",
+  "type": "object",
+  "properties": {
+    "antenna_ports": {
+      "description": "Antenna-port outputs (the RF field at an antenna, before any receiver).",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AntennaPort"
+      }
+    },
+    "emitters": {
+      "description": "RF emitters.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Emitter"
+      }
+    },
+    "epoch": {
+      "description": "UTC instant of truth time zero.",
+      "$ref": "#/$defs/Epoch"
+    },
+    "library": {
+      "description": "Where library items are looked up.",
+      "$ref": "#/$defs/Library"
+    },
+    "metadata": {
+      "description": "Descriptive information.",
+      "$ref": "#/$defs/Metadata"
+    },
+    "platforms": {
+      "description": "Platforms: anything with a position that carries emitters or receivers.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Platform"
+      }
+    },
+    "receivers": {
+      "description": "Virtual receivers and their channels.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Receiver"
+      }
+    },
+    "resources": {
+      "description": "Shared hardware resources (NIC, disk, USB, PCIe) that sinks use.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Resource"
+      }
+    },
+    "run_mode": {
+      "description": "How the run is paced.",
+      "$ref": "#/$defs/RunMode"
+    },
+    "schema_version": {
+      "description": "Scenario format version. This build reads version 1.",
+      "type": "integer",
+      "format": "uint32",
+      "const": 1,
+      "minimum": 0
+    },
+    "seed": {
+      "description": "Seed for every random stream (0 to 2⁶³−1, the TOML integer range).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "sinks": {
+      "description": "Output sinks that channels and antenna ports stream to.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Sink"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "metadata",
+    "epoch",
+    "seed",
+    "run_mode"
+  ],
+  "$defs": {
+    "Altitude": {
+      "description": "A altitude with a unit (m, km, ft, nmi, FL), written as a string, e.g. \"35000 ft MSL\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "35000 ft MSL"
+      ],
+      "pattern": "^\\s*(?:FL\\s*[0-9]{1,3}|[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:m|km|ft|nmi)\\s+(?:MSL|AGL|HAE|ellipsoid))\\s*$"
+    },
+    "AntennaPort": {
+      "description": "An antenna-port output: the field at an antenna, band-limited by B_out, with\nno virtual-receiver effects (contracts §5).",
+      "type": "object",
+      "properties": {
+        "bandwidth": {
+          "description": "Bandwidth of the output response B_out (at most the sample rate).",
+          "$ref": "#/$defs/Frequency"
+        },
+        "center_frequency": {
+          "description": "Output centre frequency.",
+          "$ref": "#/$defs/Frequency"
+        },
+        "mount": {
+          "description": "The mount the antenna sits on (default: the platform origin).",
+          "$ref": "#/$defs/Ident"
+        },
+        "name": {
+          "description": "Unique entity name.",
+          "$ref": "#/$defs/Ident"
+        },
+        "platform": {
+          "description": "The platform carrying the antenna.",
+          "$ref": "#/$defs/Ident"
+        },
+        "sample_rate": {
+          "description": "Complex output sample rate.",
+          "$ref": "#/$defs/SampleRate"
+        },
+        "sinks": {
+          "description": "Sinks this output streams to.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ident"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "platform",
+        "center_frequency",
+        "sample_rate",
+        "bandwidth"
+      ]
+    },
+    "Channel": {
+      "description": "One tuned channel of a virtual receiver.",
+      "type": "object",
+      "properties": {
+        "bandwidth": {
+          "description": "Usable bandwidth of the receiver response H_rx (at most the sample rate).",
+          "$ref": "#/$defs/Frequency"
+        },
+        "center_frequency": {
+          "description": "Tuned centre frequency.",
+          "$ref": "#/$defs/Frequency"
+        },
+        "clock": {
+          "description": "Sampling clock model (placeholder: only `ideal`).",
+          "$ref": "#/$defs/ClockModelSpec"
+        },
+        "lo": {
+          "description": "Local-oscillator model (placeholder: only `ideal`).",
+          "$ref": "#/$defs/LoModelSpec"
+        },
+        "name": {
+          "description": "Name, unique within the receiver.",
+          "$ref": "#/$defs/Ident"
+        },
+        "sample_rate": {
+          "description": "Complex sample rate.",
+          "$ref": "#/$defs/SampleRate"
+        },
+        "sinks": {
+          "description": "Sinks this channel streams to.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ident"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "center_frequency",
+        "sample_rate",
+        "bandwidth"
+      ]
+    },
+    "ClockModel": {
+      "description": "Available sampling-clock models.",
+      "oneOf": [
+        {
+          "description": "Samples exactly at the nominal instants (`IdealClockMap`).",
+          "type": "string",
+          "const": "ideal"
+        }
+      ]
+    },
+    "ClockModelSpec": {
+      "description": "A sampling-clock model (placeholder).",
+      "type": "object",
+      "properties": {
+        "model": {
+          "description": "The clock model.",
+          "$ref": "#/$defs/ClockModel"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model"
+      ]
+    },
+    "DataRate": {
+      "description": "A data rate with a unit (b/s, kb/s, Mb/s, Gb/s, B/s, kB/s, MB/s, GB/s), written as a string, e.g. \"1 Gb/s\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "1 Gb/s"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:b/s|kb/s|Mb/s|Gb/s|B/s|kB/s|MB/s|GB/s)\\s*$"
+    },
+    "Emitter": {
+      "description": "An RF emitter on a platform.",
+      "type": "object",
+      "properties": {
+        "behavior": {
+          "description": "Behavior from the library (placeholder reference).",
+          "$ref": "#/$defs/LibraryRef"
+        },
+        "frequency": {
+          "description": "Carrier frequency.",
+          "$ref": "#/$defs/Frequency"
+        },
+        "mount": {
+          "description": "The mount the emitter radiates from (default: the platform origin).",
+          "$ref": "#/$defs/Ident"
+        },
+        "name": {
+          "description": "Unique entity name.",
+          "$ref": "#/$defs/Ident"
+        },
+        "platform": {
+          "description": "The platform carrying the emitter.",
+          "$ref": "#/$defs/Ident"
+        },
+        "power": {
+          "description": "Transmit power at the antenna input.",
+          "$ref": "#/$defs/Power"
+        },
+        "waveform": {
+          "description": "Waveform from the library (placeholder reference).",
+          "$ref": "#/$defs/LibraryRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "platform",
+        "frequency",
+        "power",
+        "behavior",
+        "waveform"
+      ]
+    },
+    "Epoch": {
+      "description": "UTC instant of truth time zero, as a TOML date-time with a Z (or +00:00) offset, e.g. 2026-01-01T00:00:00Z. Leap seconds are not accepted.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "Frequency": {
+      "description": "A frequency with a unit (Hz, kHz, MHz, GHz), written as a string, e.g. \"1090 MHz\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "1090 MHz"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:Hz|kHz|MHz|GHz)\\s*$"
+    },
+    "Ident": {
+      "description": "An entity name or a reference to one: ASCII letters, digits, '_' and '-'.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+    },
+    "Latitude": {
+      "description": "latitude in degrees: a number (N positive) or a string in decimal degrees or degrees-minutes-seconds with an optional N/S letter, e.g. \"38°53'23.3\"N\".",
+      "anyOf": [
+        {
+          "type": "number",
+          "maximum": 90.0,
+          "minimum": -90.0
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "Library": {
+      "description": "The library search path.",
+      "type": "object",
+      "properties": {
+        "paths": {
+          "description": "Directories searched in order for library items, relative to the scenario\nfile unless absolute.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "LibraryRef": {
+      "description": "A library item name, resolved on the library search path: ASCII letters, digits, '_', '-', '.' and '/'.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_./-]*$"
+    },
+    "LoModel": {
+      "description": "Available local-oscillator models.",
+      "oneOf": [
+        {
+          "description": "No frequency or phase error.",
+          "type": "string",
+          "const": "ideal"
+        }
+      ]
+    },
+    "LoModelSpec": {
+      "description": "A local-oscillator model (placeholder).",
+      "type": "object",
+      "properties": {
+        "model": {
+          "description": "The LO model.",
+          "$ref": "#/$defs/LoModel"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model"
+      ]
+    },
+    "Longitude": {
+      "description": "longitude in degrees: a number (E positive) or a string in decimal degrees or degrees-minutes-seconds with an optional E/W letter, e.g. \"77.0365 W\".",
+      "anyOf": [
+        {
+          "type": "number",
+          "maximum": 180.0,
+          "minimum": -180.0
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "Metadata": {
+      "description": "Descriptive information about the scenario.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "description": "Free-text description.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Short scenario name.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Mgrs": {
+      "description": "An MGRS reference on WGS84 (zone, band, 100 km square, 0–5 digits each of easting and northing), e.g. \"18SUJ2337106519\". It denotes the south-west corner of the grid square. Polar (UPS) bands A, B, Y, Z are not supported.",
+      "type": "string",
+      "examples": [
+        "18SUJ2337106519"
+      ],
+      "pattern": "^\\s*[0-9]{1,2}\\s*[C-HJ-NP-Xc-hj-np-x]\\s*[A-HJ-NP-Za-hj-np-z]{2}\\s*(?:[0-9]\\s*){0,10}$"
+    },
+    "Mount": {
+      "description": "An antenna mount on a platform (placeholder: lever arm and orientation come later).",
+      "type": "object",
+      "properties": {
+        "antenna": {
+          "description": "Antenna pattern from the library.",
+          "$ref": "#/$defs/LibraryRef"
+        },
+        "name": {
+          "description": "Name, unique within the platform.",
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "antenna"
+      ]
+    },
+    "Platform": {
+      "description": "A platform: a body with a position, trajectory and antenna mounts.",
+      "type": "object",
+      "properties": {
+        "mounts": {
+          "description": "Antenna mounts on the platform body.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Mount"
+          }
+        },
+        "name": {
+          "description": "Unique entity name.",
+          "$ref": "#/$defs/Ident"
+        },
+        "position": {
+          "description": "Initial position.",
+          "$ref": "#/$defs/Position"
+        },
+        "trajectory": {
+          "description": "Motion model (placeholder: only `static`).",
+          "$ref": "#/$defs/Trajectory"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "position"
+      ]
+    },
+    "Position": {
+      "description": "A WGS84 position: `lat` and `lon`, or `mgrs`, plus `alt`.",
+      "type": "object",
+      "properties": {
+        "alt": {
+          "description": "Altitude with its reference, e.g. \"120 m AGL\".",
+          "$ref": "#/$defs/Altitude"
+        },
+        "lat": {
+          "description": "Geodetic latitude (WGS84).",
+          "$ref": "#/$defs/Latitude"
+        },
+        "lon": {
+          "description": "Geodetic longitude (WGS84).",
+          "$ref": "#/$defs/Longitude"
+        },
+        "mgrs": {
+          "description": "MGRS reference (instead of lat/lon); the south-west corner of its square.",
+          "$ref": "#/$defs/Mgrs"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "not": {
+            "required": [
+              "mgrs"
+            ]
+          },
+          "required": [
+            "lat",
+            "lon"
+          ]
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "lat"
+                ]
+              },
+              {
+                "required": [
+                  "lon"
+                ]
+              }
+            ]
+          },
+          "required": [
+            "mgrs"
+          ]
+        }
+      ],
+      "required": [
+        "alt"
+      ]
+    },
+    "Power": {
+      "description": "A power with a unit (W, mW, dBm, dBW), written as a string, e.g. \"30 dBm\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "30 dBm"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:W|mW|dBm|dBW)\\s*$"
+    },
+    "Receiver": {
+      "description": "A virtual receiver: an antenna on a platform feeding one or more channels.",
+      "type": "object",
+      "properties": {
+        "channels": {
+          "description": "Receiver channels (at least one).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Channel"
+          }
+        },
+        "mount": {
+          "description": "The mount the receiver antenna sits on (default: the platform origin).",
+          "$ref": "#/$defs/Ident"
+        },
+        "name": {
+          "description": "Unique entity name.",
+          "$ref": "#/$defs/Ident"
+        },
+        "platform": {
+          "description": "The platform carrying the receiver antenna.",
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "platform",
+        "channels"
+      ]
+    },
+    "Resource": {
+      "description": "A shared hardware resource with an optional usable capacity (contracts §8).",
+      "type": "object",
+      "properties": {
+        "capacity": {
+          "description": "Usable capacity, e.g. \"1 Gb/s\". Omitted means unknown, reported as unverified.",
+          "$ref": "#/$defs/DataRate"
+        },
+        "kind": {
+          "description": "Resource type.",
+          "$ref": "#/$defs/ResourceKind"
+        },
+        "name": {
+          "description": "Unique entity name.",
+          "$ref": "#/$defs/Ident"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind"
+      ]
+    },
+    "ResourceKind": {
+      "description": "Shared resource types.",
+      "oneOf": [
+        {
+          "description": "A network interface.",
+          "type": "string",
+          "const": "nic"
+        },
+        {
+          "description": "A disk or storage volume.",
+          "type": "string",
+          "const": "disk"
+        },
+        {
+          "description": "A USB controller.",
+          "type": "string",
+          "const": "usb"
+        },
+        {
+          "description": "A PCIe link or root port.",
+          "type": "string",
+          "const": "pcie"
+        }
+      ]
+    },
+    "RunMode": {
+      "description": "How a run is paced.",
+      "oneOf": [
+        {
+          "description": "As fast as possible; no deadlines.",
+          "type": "string",
+          "const": "offline"
+        },
+        {
+          "description": "Paced to the wall clock, with sink deadlines and resource budgets.",
+          "type": "string",
+          "const": "realtime"
+        }
+      ]
+    },
+    "SampleRate": {
+      "description": "A sample rate with a unit (S/s, kS/s, MS/s, GS/s), written as a string, e.g. \"61.44 MS/s\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "61.44 MS/s"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:S/s|kS/s|MS/s|GS/s)\\s*$"
+    },
+    "Sink": {
+      "description": "An output sink (placeholder: endpoint and file settings come with the sinks).",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Sink type.",
+          "$ref": "#/$defs/SinkKind"
+        },
+        "name": {
+          "description": "Unique entity name.",
+          "$ref": "#/$defs/Ident"
+        },
+        "resources": {
+          "description": "Shared resources this sink's traffic crosses.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ident"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind"
+      ]
+    },
+    "SinkKind": {
+      "description": "Output sink types (plan \"Interfaces\", IQ outputs).",
+      "oneOf": [
+        {
+          "description": "SigMF recording.",
+          "type": "string",
+          "const": "sigmf"
+        },
+        {
+          "description": "Strict, acknowledged framed ZMQ stream.",
+          "type": "string",
+          "const": "zmq_framed"
+        },
+        {
+          "description": "VITA-49 over UDP.",
+          "type": "string",
+          "const": "vita49"
+        },
+        {
+          "description": "Best-effort raw ZMQ PUB preview.",
+          "type": "string",
+          "const": "zmq_preview"
+        }
+      ]
+    },
+    "Trajectory": {
+      "description": "A platform motion model (placeholder).",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "The trajectory kind.",
+          "$ref": "#/$defs/TrajectoryKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "TrajectoryKind": {
+      "description": "Available motion models.",
+      "oneOf": [
+        {
+          "description": "The platform stays at its position.",
+          "type": "string",
+          "const": "static"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,48 @@
+# expect: 36:15: sample rate needs a unit: got the bare number 10000000
+schema_version = 1
+epoch = 2026-01-01T00:00:00Z
+seed = 1
+run_mode = "offline"
+
+[metadata]
+name = "minimal"
+description = "One static CW emitter at 1090 MHz seen by one receiver."
+
+[[platforms]]
+name = "beacon"
+position = { lat = "38°53'23.3\"N", lon = "77°02'11.5\"W", alt = "10 m AGL" }
+
+[[platforms]]
+name = "site"
+position = { mgrs = "18SUJ2337106519", alt = "25 m MSL" }
+mounts = [{ name = "mast", antenna = "isotropic" }]
+
+[[emitters]]
+name = "cw"
+platform = "beacon"
+frequency = "1090 MHz"
+power = "30 dBm"
+behavior = "always_on"
+waveform = "cw"
+
+[[receivers]]
+name = "rx"
+platform = "site"
+mount = "mast"
+
+[[receivers.channels]]
+name = "ch0"
+center_frequency = "1090 MHz"
+sample_rate = 10000000
+bandwidth = "8 MHz"
+sinks = ["recording"]
+
+[[sinks]]
+name = "recording"
+kind = "sigmf"
+resources = ["scratch_disk"]
+
+[[resources]]
+name = "scratch_disk"
+kind = "disk"
+capacity = "400 MB/s"

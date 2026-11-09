@@ -16,6 +16,7 @@ Commands:
   ci                  Check formatting, lints, tests, docs, and dependencies
   deps                Check architectural dependency boundaries
   bless [TEST ARGS]   Regenerate golden hashes and show changed goldens
+  schema              Regenerate schema/scenario.schema.json
   gpu-test            Placeholder for CUDA tests (prompt 20)
   help                Print help";
 
@@ -172,6 +173,34 @@ fn bless(args: &[std::ffi::OsString]) -> TaskResult {
     )
 }
 
+/// Regenerates the checked-in scenario JSON Schema from the Rust types. A test in
+/// iqsim-scenario fails while the checked-in file is stale, so `ci` catches drift.
+fn schema() -> TaskResult {
+    let output = workspace_root().join("schema/scenario.schema.json");
+    run(
+        "cargo run -p iqsim-scenario --example write_schema",
+        cargo()
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--locked",
+                "-p",
+                "iqsim-scenario",
+                "--example",
+                "write_schema",
+                "--",
+            ])
+            .arg(&output),
+    )?;
+    run(
+        "git status --short schema",
+        Command::new("git")
+            .current_dir(workspace_root())
+            .args(["status", "--short", "schema"]),
+    )
+}
+
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let Some(command) = args.first() else {
@@ -182,6 +211,7 @@ fn main() -> ExitCode {
         Some("ci") if args.len() == 1 => ci(),
         Some("deps") if args.len() == 1 => deps(),
         Some("bless") => bless(&args[1..]),
+        Some("schema") if args.len() == 1 => schema(),
         Some("gpu-test") if args.len() == 1 => {
             println!("CUDA tests arrive in prompt 20.");
             Ok(())

@@ -16,6 +16,7 @@ Contents:
 8. Resource budgeting
 9. Crate placement and dependency graph
 10. Proposed tolerances and decisions phase 1 must settle
+11. Scenario quantities and files
 
 ---
 
@@ -388,3 +389,51 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 10. Error-budget sampling and refinement policy, including derivative bounds vs adaptive refinement and maximum depth (before phase 3).
 
 Later phases pin these with the implementation: the manifest canonical encoding, the VITA-49 profile (timestamp units, MTU, context cadence) and the strict-sink window defaults.
+
+## 11. Scenario quantities and files
+
+Scenario files are TOML, read by `iqsim-scenario` into types from `iqsim-units`. `schema/scenario.schema.json` is generated from those types (`cargo xtask schema`), and a test fails when it is stale.
+
+### 11.1 Quantity text
+
+- A quantity is a string: a number, optional whitespace, then a **case-sensitive** unit (`"1090 MHz"`, `"1090MHz"`; `"1090 mhz"` is an error because `mHz` and `MHz` differ).
+- The number is `[+-]digits[.digits][e[+-]digits]` with at most 38 significant digits. It is parsed as an **exact decimal**, never through an intermediate f64.
+- A bare TOML number where a unit is required is rejected, and the message suggests a spelling. Latitude and longitude are the exception: a bare number is decimal degrees.
+
+### 11.2 Representations
+
+| Type | Units | Representation | Rule |
+| --- | --- | --- | --- |
+| `Frequency` | Hz, kHz, MHz, GHz | i64 µHz (±9.2 THz) | exact; finer than 1 µHz is an error |
+| `SampleRate` | S/s, kS/s, MS/s, GS/s | `iqsim_core::SampleRate` | exact reduced rational; core bounds (§10 decision 1) |
+| `Duration` | s, ms, us/µs, ns, ps | `TruthDuration` (i64 ps) | exact; finer than 1 ps is an error |
+| `DataRate` | b/s, kb/s, Mb/s, Gb/s, B/s, kB/s, MB/s, GB/s | u64 bit/s | exact; SI prefixes (×1000); B = 8 b |
+| `Power` | W, mW, dBm, dBW | f64 W, ≥ 0 | dB via `libm::exp10` |
+| `Gain` | dB, dBi | f64 dB | both stored as dB |
+| `Distance` | m, km, ft, nmi | f64 m | ft = 0.3048 m, nmi = 1852 m |
+| `Speed` | m/s, km/h, kt | f64 m/s | kt = 1852/3600 m/s |
+| `Angle` | deg, °, rad, DMS | f64 deg | |
+| `Altitude` | m, km, ft, nmi + reference, or `FLnnn` | f64 m + `AltitudeRef` | reference required |
+
+- `Display` output parses back to the same value for every value parsed from text. A `SampleRate` prints as an exact decimal (`2.5 S/s`). Only a rate built in code with a non-decimal denominator prints as `num/den S/s`. A flight level prints as `FLnnn`.
+- Float types apply decimal unit factors exactly (km, mW, ft, nmi) and round once to f64 with the correctly rounded std parser. km/h and kt then divide once by 3600. The f64 bits are therefore the same on every platform.
+- **Altitude references:** `MSL`, `AGL`, `ellipsoid` (alias `HAE`). `FLnnn` is a pressure altitude in the ISA standard atmosphere (1013.25 hPa datum) and stores `AltitudeRef::PressureStd` with nnn × 30.48 m. It is not a geometric height. Converting it to geometry needs the ISA model and any local pressure offset (plan, "Mode C altitude"), so it accepts no other reference.
+- **DMS:** `D°M'S"` (also `′ ″`, `º`) or ASCII `DdMmSs`. Minutes and seconds are below 60, only the last component may have a fraction, and only the degrees may carry a sign. Latitude and longitude also take an **upper-case** hemisphere letter as a prefix or suffix (N/S, E/W), which cannot be combined with a sign. Lower case is excluded because `s` is the seconds marker.
+
+### 11.3 Positions and MGRS
+
+- A position is a table `{ lat, lon, alt }` or `{ mgrs, alt }` on WGS84. Giving both forms, or only one of lat/lon, is an error.
+- An MGRS reference names a grid square. **A scenario position is the square's south-west corner** (NGA convention). `Mgrs::center()` is also available, and it is GeographicLib's representative point.
+- The decoder uses WGS84 "AA" lettering. Column sets follow the zone mod 3, and row letters start at F in even zones. The 2000 km northing cycle is chosen by requiring the **100 km block** (not the digit square, so validity does not depend on precision, as in GeographicLib) to meet its latitude band, with 0.01° slack. A southern-hemisphere block must lie south of the equator. Zones 32X, 34X and 36X are rejected. Whitespace is ignored and letters may be lower case.
+- The UTM inverse uses Karney's (2011) Krüger series to n⁶ and Newton iteration, all through `libm`. It agrees with GeographicLib GeoConvert to 5·10⁻¹² ° and with PROJ to 5·10⁻¹³ °, which is the print precision of the reference files.
+- Polar UPS references (bands A, B, Y, Z) are rejected as not supported.
+
+### 11.4 Scenario file rules
+
+- Every table uses `deny_unknown_fields`. The top level requires `schema_version = 1`, `metadata.name`, `epoch`, `seed` and `run_mode` (`offline` or `realtime`).
+- **Epoch:** a TOML offset date-time (or the same text as a string) in UTC (`Z` or `+00:00`), with fractional seconds to 1 ns. It is stored as POSIX seconds plus nanoseconds. A leap second (`:60`) is rejected.
+- **Seed:** a TOML integer from 0 to 2⁶³−1.
+- **Names:** entity names (platforms, emitters, receivers, antenna ports, sinks, resources) share one namespace and match `[A-Za-z0-9][A-Za-z0-9_-]*`. Mount names are unique within their platform, and channel names within their receiver. Library references (antennas, behaviors, waveforms) may also contain `.` and `/`. They are not resolved yet.
+- **Lint checks:** references name an entity of the right kind, and a mount reference names a mount on the referenced platform. Emitter and centre frequencies are positive. Each channel's H_rx bandwidth and each antenna port's B_out bandwidth is positive and at most its complex sample rate, compared exactly as µHz·den ≤ 10⁶·num. A receiver has at least one channel.
+- **Diagnostics:** `file:line:col: error: message` with 1-based lines and columns counted in characters, then the source line with a caret under the span. Duplicates add a `note:` at the first definition. `sim lint` exits 0 when clean, 1 on errors or an unreadable file, and 2 on usage errors.
+- Clock and LO models (`{ model = "ideal" }`), trajectories (`{ kind = "static" }`), mounts, sinks and resources are placeholders that later prompts extend. Resource capacity is optional, and a missing capacity is reported as unverified (§8).
