@@ -8,13 +8,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod geometry;
 pub mod offline;
 pub mod plan;
-pub mod static_scene;
+pub mod scene;
 pub mod trajectory;
 
 pub use offline::{
-    LoadedScenario, ReplayReport, RunError, RunOptions, build_identity, load_scenario, replay,
-    run_offline, truth_record,
+    GeometryLog, LoadedScenario, PathFitSummary, ReplayReport, RunError, RunOptions,
+    TRUTH_SCHEMA_VERSION, build_identity, load_scenario, replay, run_offline, truth_record,
 };
 pub use plan::{ResolveError, ResolvedScenario, RunPlan, StreamPlan, resolve};

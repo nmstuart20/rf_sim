@@ -6,6 +6,8 @@
 //! samples of a kernel computed by time-domain Simpson quadrature of the test's own
 //! sinc·Gaussian impulse responses.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18,7 +20,7 @@ use iqsim_core::{
 };
 use iqsim_geo::Ecef;
 use iqsim_render::{Backend, CpuBackend};
-use iqsim_runtime::static_scene::{
+use iqsim_runtime::scene::{
     ContinuousSpec, SceneError, SharedSource, StaticEmitter, StaticScene, StaticSceneBuilder,
     StaticTarget, StaticWaveform,
 };
@@ -160,7 +162,12 @@ fn scene(carrier_uhz: i64, waveform: StaticWaveform) -> StaticScene {
 }
 
 fn friis_volts(carrier_hz: f64) -> f64 {
-    (POWER_W * 50.0).sqrt() * (C / carrier_hz) / (4.0 * PI * RANGE_M)
+    (POWER_W * 50.0).sqrt() * (C / carrier_hz) / (4.0 * PI * (C * link_tau()))
+}
+
+/// The test link's light time in ECI, Sagnac included (independent reference).
+fn link_tau() -> f64 {
+    common::eci_delay([6_378_137.0, 0.0, 0.0], [6_378_137.0, RANGE_M, 0.0])
 }
 
 fn builder<'c>(
@@ -386,7 +393,7 @@ fn chirp_matches_an_independent_direct_sum_at_fractional_delays() {
             CENTER_UHZ + mhz(5.0),
             continuous(x.clone(), EndPolicy::ZeroPad, start_ps),
         );
-        let tau = RANGE_M / C;
+        let tau = link_tau();
         for target in targets() {
             let h = response_of(&target);
             let b = builder(&sc, &target, &clock, LEN);

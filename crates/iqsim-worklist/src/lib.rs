@@ -11,7 +11,12 @@
 //!
 //! # Coordinates and units
 //!
-//! - **Local sample index** k ∈ [0, len) within the block. Every polynomial is in k.
+//! - **Local sample index** k ∈ [0, len) within the block. A [`PathSegment`] covers
+//!   the samples `[first, first + len)` of its block (prompt 9: the geometry engine
+//!   splits a path at trajectory knots and wherever its fit needs refining), and every
+//!   polynomial of the segment is in the **segment-local index** j = k − first over
+//!   its own `len` samples. A path whose fit needs no split is one segment covering the
+//!   whole block.
 //! - **Delay** ([`PathSegment::delay`]): Q32.32 output samples (`DelayPoly` registers).
 //!   It carries the path delay for truth and diagnostics. The renderer reads time from
 //!   the waveform coordinate instead.
@@ -31,7 +36,7 @@
 //!   `f_off·t_acq(k) − f_c·τ(k)` plus any folded response phase (`PhasePoly`
 //!   registers, wrapping by design).
 //! - **Amplitude** ([`AmplitudePoly`]): volts at the target's reference plane, an f32
-//!   cubic in x = k·(1/len), evaluated by Horner from scratch at every sample so the
+//!   cubic in x = j·(1/len) (segment index and length), evaluated by Horner from scratch at every sample so the
 //!   value never depends on where a chunk starts.
 //!
 //! Dependencies: iqsim-core.
@@ -159,7 +164,9 @@ pub struct EmissionRef {
     pub index: u32,
 }
 
-/// One propagation path of one emission into one render target, for one block.
+/// One propagation path of one emission into one render target, over the samples
+/// `[first, first + len)` of one block. Its polynomials are in the segment-local index
+/// j = k − first, j ∈ [0, len).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PathSegment {
@@ -181,6 +188,10 @@ pub struct PathSegment {
     pub coord_source: u32,
     /// The emission.
     pub emission: EmissionRef,
+    /// Block-local index of the segment's first sample.
+    pub first: u32,
+    /// Samples in the segment (≥ 1; `first + len` ≤ the block length).
+    pub len: u32,
 }
 
 /// A continuous-wave emission: a constant complex envelope (normally 1 + 0j). Any tap
@@ -522,40 +533,34 @@ impl BlockWorkList {
             {
                 return Err(bad());
             }
+            let seg_len = u64::from(p.len);
+            if p.len == 0 || u64::from(p.first) + seg_len > self.len {
+                return Err(bad());
+            }
             let coord = p
                 .coord
-                .to_poly::<iqsim_core::Delay>(self.len)
+                .to_poly::<iqsim_core::Delay>(seg_len)
                 .map_err(|_| bad())?;
             p.delay
-                .to_poly::<iqsim_core::Delay>(self.len)
+                .to_poly::<iqsim_core::Delay>(seg_len)
                 .map_err(|_| bad())?;
             p.phase
-                .to_poly::<iqsim_core::Phase>(self.len)
+                .to_poly::<iqsim_core::Phase>(seg_len)
                 .map_err(|_| bad())?;
-            // v1 coordinates are linear and non-decreasing (D2 = D3 = 0, D1 ≥ 0), so the
-            // endpoint checks bound every interior value too. A cubic coordinate (phase 3
-            // geometry) needs an extremum check here before it is accepted.
-            let d = coord.registers();
-            if d[2] != U128::ZERO || d[3] != U128::ZERO || (d[1].hi as i64) < 0 {
+            // The coordinate must be non-decreasing over the segment, and its exact
+            // value must not wrap mod 2¹²⁸ anywhere in it (contracts §5.2). Then the
+            // endpoints bound every interior value (review fix, prompt 6a: a huge slope
+            // could wrap back into range).
+            if !coordinate_is_monotone(&coord.registers(), seg_len) {
                 return Err(bad());
             }
-            // The endpoints bound the interior only if D0 + (len − 1)·D1 does not wrap
-            // mod 2¹²⁸ (review fix: a huge D1 can wrap back into range).
-            let signed = |r: U128| ((u128::from(r.hi) << 64) | u128::from(r.lo)) as i128;
-            if signed(d[1])
-                .checked_mul(i128::from(self.len - 1))
-                .and_then(|span| span.checked_add(signed(d[0])))
-                .is_none()
-            {
-                return Err(bad());
-            }
-            for k in [0, self.len - 1] {
+            for k in [0, seg_len - 1] {
                 let w = coord.eval(k).map_err(|_| bad())?.to_bits();
                 if w.abs() >= MAX_COORD_BITS {
                     return Err(bad());
                 }
                 // Every Farrow tap of a continuous path lies inside its window. The
-                // coordinate is linear and non-decreasing, so the endpoints bound it.
+                // coordinate is non-decreasing, so the endpoints bound it.
                 if let Some(h) = window {
                     let cell = w >> (32 - h.log2_up);
                     if cell < FARROW_BEFORE as i64 || cell + FARROW_AFTER as i64 > i64::from(h.len)
@@ -596,7 +601,7 @@ impl BlockWorkList {
     /// including the referenced tables. Used for tap-isolation and cache checks.
     pub fn content_hash(&self) -> [u8; 32] {
         let mut h = Sha256::new();
-        h.update(b"iqsim.worklist.v1\0");
+        h.update(b"iqsim.worklist.v2\0");
         h.update(self.target.response);
         h.update(self.target.tap_kind.to_le_bytes());
         h.update(self.target.lsb_per_volt.to_le_bytes());
@@ -621,6 +626,8 @@ impl BlockWorkList {
                 p.coord_source,
                 p.emission.kind,
                 p.emission.index,
+                p.first,
+                p.len,
             ] {
                 h.update(v.to_le_bytes());
             }
@@ -672,6 +679,59 @@ impl BlockWorkList {
     }
 }
 
+/// Whether the coordinate polynomial with registers `d` (Q32.96, read as signed) is
+/// non-decreasing over local indices `[0, len)` without wrapping.
+///
+/// Its exact value `D0 + j·D1 + C(j,2)·D2 + C(j,3)·D3` must fit i128 at both ends, and
+/// the step `Δ1(j) = D1 + j·D2 + C(j,2)·D3`, a quadratic in j, must be ≥ 0 for every
+/// j ∈ [0, len − 2]. The quadratic's minimum over the integers is at an end, or, when
+/// D3 > 0, at one of the two integers around its vertex `j* = ½ − D2/D3`. Every
+/// product and sum is checked, and an overflow rejects the polynomial. A value that
+/// is monotone and wrap-free between in-range endpoints never wraps in between.
+pub fn coordinate_is_monotone(d: &[U128; 4], len: u64) -> bool {
+    fn exact(d: &[i128; 4], j: i128) -> Option<i128> {
+        let c2 = j.checked_mul(j - 1)? / 2;
+        let c3 = c2.checked_mul(j - 2)? / 3;
+        d[0].checked_add(j.checked_mul(d[1])?)?
+            .checked_add(c2.checked_mul(d[2])?)?
+            .checked_add(c3.checked_mul(d[3])?)
+    }
+    fn step(d: &[i128; 4], j: i128) -> Option<i128> {
+        let c2 = j.checked_mul(j - 1)? / 2;
+        d[1].checked_add(j.checked_mul(d[2])?)?
+            .checked_add(c2.checked_mul(d[3])?)
+    }
+    if len == 0 {
+        return false;
+    }
+    let d = d.map(|r| ((u128::from(r.hi) << 64) | u128::from(r.lo)) as i128);
+    let last = i128::from(len - 1);
+    if exact(&d, 0).is_none() || exact(&d, last).is_none() {
+        return false;
+    }
+    if len == 1 {
+        return true;
+    }
+    let top = last - 1;
+    let mut candidates = vec![0, top];
+    if d[3] > 0 {
+        // ⌊j*⌋ = ⌊(D3 − 2·D2) / (2·D3)⌋.
+        let Some(num) = d[2].checked_mul(2).and_then(|t| d[3].checked_sub(t)) else {
+            return false;
+        };
+        let Some(den) = d[3].checked_mul(2) else {
+            return false;
+        };
+        let jc = num.div_euclid(den);
+        for j in [jc, jc.saturating_add(1)] {
+            candidates.push(j.clamp(0, top));
+        }
+    }
+    candidates
+        .into_iter()
+        .all(|j| step(&d, j).is_some_and(|v| v >= 0))
+}
+
 /// The [`TargetDesc`] for a response and scale.
 pub fn target_desc(kind: TapKind, response: TapResponseId, lsb_per_volt: f32) -> TargetDesc {
     TargetDesc {
@@ -694,7 +754,10 @@ mod tests {
         assert_eq!(size_of::<PolyRegisters>(), 64);
         assert_eq!(size_of::<AmplitudePoly>(), 20);
         assert_eq!(size_of::<EmissionRef>(), 8);
-        assert_eq!(size_of::<PathSegment>(), 3 * 64 + 8 + 20 + 3 * 4 + 8);
+        assert_eq!(
+            size_of::<PathSegment>(),
+            3 * 64 + 8 + 20 + 3 * 4 + 8 + 2 * 4
+        );
         assert_eq!(align_of::<PathSegment>(), 8);
         assert_eq!(size_of::<CwEmission>(), 8);
         assert_eq!(size_of::<PulseTrain>(), 8);
@@ -786,6 +849,8 @@ mod tests {
                     kind: EMISSION_PULSE_TRAIN,
                     index: 0,
                 },
+                first: 0,
+                len: len as u32,
             }],
             cw: vec![],
             trains: vec![PulseTrain {
@@ -812,7 +877,7 @@ mod tests {
         wl.paths[0].block = 4;
         assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
         wl.paths[0].block = 3;
-        // A curved coordinate is rejected by shape, before any endpoint check: endpoint
+        // A coordinate that turns back is rejected before any endpoint check: endpoint
         // checks alone miss an interior wrap such as w(k) = 2²⁹k(4 − k) over 5 samples.
         let curved = DelayPoly::from_f64_differences(
             [0.0, 3.0 * 536_870_912.0, -2.0 * 536_870_912.0, 0.0],
@@ -823,6 +888,18 @@ mod tests {
         wl.paths[0].coord = PolyRegisters::from_poly(&curved);
         assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
         wl.paths[0].coord = saved;
+        // Segment ranges: empty or past the block end are rejected; a sub-range is fine.
+        wl.paths[0].len = 0;
+        assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
+        wl.paths[0].first = 1;
+        wl.paths[0].len = len as u32;
+        assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
+        wl.paths[0].len = len as u32 - 1;
+        // The registers were built for `len` samples; over `len − 1` they still are a
+        // valid, monotone polynomial.
+        wl.validate().unwrap();
+        wl.paths[0].first = 0;
+        wl.paths[0].len = len as u32;
         wl.pulses[0].amplitude = 2e6;
         assert_eq!(wl.validate(), Err(WorkListError::Pulse { train: 0 }));
         wl.pulses[0].amplitude = 1.0;
@@ -830,6 +907,37 @@ mod tests {
         wl.paths[0].emission.kind = EMISSION_CW;
         assert_eq!(wl.validate(), Err(WorkListError::Path { index: 0 }));
         assert_ne!(wl.content_hash(), h);
+    }
+
+    #[test]
+    fn monotone_cubic_coordinates_are_accepted_and_interior_dips_are_not() {
+        let regs =
+            |d: [f64; 4], len: u64| DelayPoly::from_f64_differences(d, len).unwrap().registers();
+        // Linear, and a gently curving cubic (geometry fits look like this).
+        assert!(coordinate_is_monotone(
+            &regs([5.0, 1.0, 0.0, 0.0], 1000),
+            1000
+        ));
+        assert!(coordinate_is_monotone(
+            &regs([5.0, 1.0, 1e-7, -1e-10], 1000),
+            1000
+        ));
+        // Step 1 − 0.002·j + 1e-6·C(j,2): its vertex is near j = 2001, where the step is
+        // ≈ −1.0. Both ends are increasing, so only the vertex test catches it.
+        let dip = regs([0.0, 1.0, -0.002, 1e-6], 4000);
+        assert!(!coordinate_is_monotone(&dip, 4000));
+        // Over the first 100 samples the same polynomial is still increasing.
+        assert!(coordinate_is_monotone(&dip, 100));
+        // Decreasing at the start (concave), and a value that wraps i128.
+        assert!(!coordinate_is_monotone(
+            &regs([0.0, -1e-9, 0.0, 0.0], 10),
+            10
+        ));
+        let huge = [U128::ZERO, U128::new(1 << 62, 0), U128::ZERO, U128::ZERO];
+        assert!(!coordinate_is_monotone(&huge, 4));
+        assert!(coordinate_is_monotone(&huge, 2));
+        assert!(coordinate_is_monotone(&regs([1.0, -5.0, 0.0, 0.0], 1), 1));
+        assert!(!coordinate_is_monotone(&regs([0.0; 4], 1), 0));
     }
 
     #[test]
@@ -875,6 +983,8 @@ mod tests {
                     kind: EMISSION_CONTINUOUS,
                     index: 0,
                 },
+                first: 0,
+                len: len as u32,
             }
         };
         let mut wl = BlockWorkList {

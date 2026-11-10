@@ -1,7 +1,7 @@
 # Trajectory kinds (prompt 8): static, maneuvers, route, track and ground.
 # Lint it with: sim lint examples/trajectories.toml
-# `sim run` does not render moving platforms yet (light-time geometry is prompt 9);
-# it builds these trajectories and then stops with an explicit error.
+# It has no emitters or receivers; `sim run` builds every trajectory and records each
+# platform's fingerprint in the resolved scenario. examples/moving.toml renders one.
 
 schema_version = 1
 epoch = 2026-01-01T00:00:00Z

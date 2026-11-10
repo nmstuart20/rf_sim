@@ -14,7 +14,7 @@
 //!
 //! # Pipeline, per stream
 //!
-//! Static work list for block b → CPU render into zeroed i64 accumulators → the
+//! Work list for block b (light-time geometry fit, [`crate::geometry`]) → CPU render into zeroed i64 accumulators → the
 //! complete sum goes once through the virtual-receiver chain ([`ReceiverChannelState`])
 //! or, for an antenna port, the [`PortConverter`] → every SigMF sink of the stream.
 //! Blocks run in order. The last block is rendered whole and truncated to the stream's
@@ -28,9 +28,11 @@
 //! 16). It then re-renders and requires every output's count and SHA-256 and the truth
 //! hash to match.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use iqsim_contracts::{
@@ -42,6 +44,7 @@ use iqsim_core::{
     BlockSpec, ClockMap, IdealTimestampClock, NUMERIC_CONTRACT_VERSION, SampleIndex, TapKind,
     TapResponse, TimestampClock,
 };
+use iqsim_geo::trajectory::Lookback;
 use iqsim_io::IoError;
 use iqsim_io::sigmf::{CheckedSampleSink, SampleFormat, SigmfCapture, SigmfGlobal, SigmfWriter};
 use iqsim_receiver::{
@@ -50,11 +53,12 @@ use iqsim_receiver::{
 use iqsim_render::{Backend, CpuBackend, RenderError};
 use serde_json::{Value, json};
 
+use crate::geometry::{PathGeometry, Residuals};
 use crate::plan::{
     ResolveError, ResolvedGeoid, ResolvedScenario, RunPlan, StreamPlan, resolution_warnings,
     resolve,
 };
-use crate::static_scene::{SceneError, StaticSceneBuilder};
+use crate::scene::{SceneBuilder, SceneError};
 
 /// A failed run or replay.
 #[derive(Debug)]
@@ -180,16 +184,32 @@ pub fn load_scenario(path: &Path) -> Result<LoadedScenario, RunError> {
     })
 }
 
+/// The geometry-fit summary of one (stream, emitter) path over a run (contracts §14.4).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PathFitSummary {
+    /// Blocks fitted.
+    pub blocks: u64,
+    /// Segments over all blocks.
+    pub segments: u64,
+    /// Worst residuals over every segment of every block.
+    pub residuals: Residuals,
+    /// Every split: (block, block-local sample, reason, residuals of a refined interval).
+    pub splits: Vec<(u64, u64, &'static str, Option<Residuals>)>,
+}
+
+/// Per stream id, one [`PathFitSummary`] per emitter (in emitter order).
+pub type GeometryLog = BTreeMap<String, Vec<PathFitSummary>>;
+
 /// Output samples of one stream after the chain or port conversion, written to sinks
-/// as they come.
+/// as they come. Returns the ADC clip count and the stream's fit summaries.
 fn render_stream(
     plan: &StreamPlan,
     backend: &CpuBackend,
     emit: &mut dyn FnMut(&Samples) -> Result<(), RunError>,
-) -> Result<u64, RunError> {
+) -> Result<(u64, Vec<PathFitSummary>), RunError> {
     let r = &plan.resolved;
     let blocks = BlockSpec::new(r.block_len).map_err(SceneError::Time)?;
-    let builder = StaticSceneBuilder::new(&plan.scene, &plan.target, &plan.clock, blocks)?
+    let builder = SceneBuilder::new(&plan.scene, &plan.target, &plan.clock, blocks)?
         .with_sample_limit(r.sample_count);
     let mut chain = match plan.chain {
         Some(c) => Some(ReceiverChannelState::new(c)?),
@@ -198,8 +218,21 @@ fn render_stream(
     let port = PortConverter::new(plan.format);
     let total = r.sample_count;
     let nblocks = total.div_ceil(r.block_len);
+    let mut summaries = vec![PathFitSummary::default(); plan.scene.emitters.len()];
     for b in 0..nblocks {
-        let work = builder.build_block(b)?;
+        let (work, log) = builder.build_block_logged(b)?;
+        for p in &log.paths {
+            let sum = &mut summaries[p.link];
+            sum.blocks += 1;
+            sum.segments += p.fit.segments.len() as u64;
+            sum.residuals = sum.residuals.max(p.fit.residuals());
+            sum.splits.extend(
+                p.fit
+                    .splits
+                    .iter()
+                    .map(|s| (b, s.at, s.reason.name(), s.residuals)),
+            );
+        }
         let mut acc = vec![0_i64; 2 * work.len as usize];
         backend.render(&work, &mut acc)?;
         let first = b * r.block_len;
@@ -215,7 +248,7 @@ fn render_stream(
         };
         emit(&samples)?;
     }
-    Ok(chain.map_or(0, |c| c.clipped_total()))
+    Ok((chain.map_or(0, |c| c.clipped_total()), summaries))
 }
 
 fn sigmf_format(f: OutputFormat) -> SampleFormat {
@@ -241,10 +274,16 @@ fn tap_name(plan: &StreamPlan) -> &'static str {
     }
 }
 
-/// The canonical truth record: per stream and emitter, the link geometry and level,
-/// mapped to the stream's sample indices. It is a privileged export (never in consumer
-/// files).
-pub fn truth_record(plan: &RunPlan) -> Result<Value, RunError> {
+/// Truth record schema (2 since prompt 9: light-time geometry, Doppler and the
+/// geometry-fit log).
+pub const TRUTH_SCHEMA_VERSION: u32 = 2;
+
+/// The canonical truth record: per stream its index and time mapping; per stream and
+/// emitter the path at the stream's first sample (light-time range, range rate,
+/// Doppler, emission instant, delay, level) and the run's geometry-fit summary from
+/// `geometry` (worst residuals and every split). It is a privileged export (never in
+/// consumer files).
+pub fn truth_record(plan: &RunPlan, geometry: &GeometryLog) -> Result<Value, RunError> {
     let mut links = Vec::new();
     let mut streams = Vec::new();
     for s in &plan.streams {
@@ -286,35 +325,54 @@ pub fn truth_record(plan: &RunPlan) -> Result<Value, RunError> {
             "first_sample_reported": [reported.ps, reported.frac],
             "effective_full_scale_volts": scale.full_scale_effective_volts(),
         }));
-        for (e, re) in s.scene.emitters.iter().zip(&plan.resolved.emitters) {
-            let range = s.scene.receiver.distance(e.position);
+        let fits = geometry.get(&s.resolved.id);
+        for (i, (e, re)) in s
+            .scene
+            .emitters
+            .iter()
+            .zip(&plan.resolved.emitters)
+            .enumerate()
+        {
+            // The path at the stream's first sample (light time in ECI, contracts §14).
+            let path = PathGeometry {
+                rx: Arc::clone(&s.scene.receiver),
+                tx: Arc::new(
+                    Lookback::new(Arc::clone(&e.trajectory), iqsim_geo::MAX_LOOKBACK)
+                        .map_err(SceneError::Geo)?,
+                ),
+            };
+            let lt = path.at(t0).map_err(SceneError::Geo)?;
             let carrier_hz = e.carrier_uhz as f64 * 1e-6;
             let lambda = iqsim_geo::SPEED_OF_LIGHT_M_S / carrier_hz;
-            let path = lambda / (4.0 * core::f64::consts::PI * range);
+            let friis = lambda / (4.0 * core::f64::consts::PI * lt.range_m);
             let offset_hz = (e.carrier_uhz - t.center_uhz) as f64 * 1e-6;
-            let gain = resp.magnitude(offset_hz);
-            let delay_s = range / iqsim_geo::SPEED_OF_LIGHT_M_S;
+            let doppler_hz = -(carrier_hz * lt.tau_rate);
+            let gain = resp.magnitude(offset_hz + doppler_hz);
+            let delay_s = lt.tau_s;
             let mut link = json!({
                 "stream": s.resolved.id,
                 "emitter": re.name,
-                "range_m": range,
+                "range_m": lt.range_m,
+                "range_rate_m_s": lt.tau_rate * iqsim_geo::SPEED_OF_LIGHT_M_S,
+                "doppler_hz": doppler_hz,
+                "emission_time": [lt.tx.instant.ps().as_ps(), lt.tx.instant.frac()],
                 "delay_s": delay_s,
                 "delay_render_samples": delay_s * rate_hz,
                 "carrier_offset_hz": offset_hz,
                 "response_gain": gain,
-                "power_at_target_w": e.power_w * (path * path) * (gain * gain),
+                "power_at_target_w": e.power_w * (friis * friis) * (gain * gain),
             });
+            let map = link.as_object_mut().expect("link is an object");
             if let Some(src) = &re.source {
                 // A wideband source has no single response gain: report the level of
                 // its reference (a full-scale or RMS tone) before band limiting, and
                 // where its samples land.
                 let native_hz = src.rate_num as f64 / src.rate_den as f64;
-                let map = link.as_object_mut().expect("link is an object");
                 map.remove("response_gain");
                 map.remove("power_at_target_w");
                 map.insert(
                     "reference_power_at_target_w".to_owned(),
-                    json!(e.power_w * (path * path)),
+                    json!(e.power_w * (friis * friis)),
                 );
                 map.insert(
                     "iq_file".to_owned(),
@@ -328,10 +386,34 @@ pub fn truth_record(plan: &RunPlan) -> Result<Value, RunError> {
                     }),
                 );
             }
+            if let Some(f) = fits.and_then(|v| v.get(i)) {
+                let res = |r: &Residuals| {
+                    json!({
+                        "delay_samples": r.delay_samples,
+                        "phase_rad": r.phase_rad,
+                        "coord_samples": r.coord_samples,
+                        "amplitude_rel": r.amplitude_rel,
+                    })
+                };
+                map.insert(
+                    "geometry_fit".to_owned(),
+                    json!({
+                        "blocks": f.blocks,
+                        "segments": f.segments,
+                        "max_residuals": res(&f.residuals),
+                        "splits": f.splits.iter().map(|(b, at, why, r)| json!({
+                            "block": b,
+                            "sample": at,
+                            "reason": why,
+                            "residuals": r.as_ref().map(res),
+                        })).collect::<Vec<_>>(),
+                    }),
+                );
+            }
             links.push(link);
         }
     }
-    Ok(json!({ "truth_schema_version": 1, "streams": streams, "links": links }))
+    Ok(json!({ "truth_schema_version": TRUTH_SCHEMA_VERSION, "streams": streams, "links": links }))
 }
 
 /// Renders every stream that has a sink. `make_sink` returns one sample sink per
@@ -342,9 +424,10 @@ fn render_all<S>(
     mut make_sink: impl FnMut(&StreamPlan, &str) -> Result<S, RunError>,
     mut write: impl FnMut(&mut S, &Samples) -> Result<(), RunError>,
     mut finish: impl FnMut(S) -> Result<(String, u64, String), RunError>,
-) -> Result<Vec<OutputRecord>, RunError> {
+) -> Result<(Vec<OutputRecord>, GeometryLog), RunError> {
     let backend = CpuBackend::new(options.threads.max(1));
     let mut outputs = Vec::new();
+    let mut log = GeometryLog::new();
     for s in &plan.streams {
         if s.resolved.sinks.is_empty() {
             continue;
@@ -353,12 +436,13 @@ fn render_all<S>(
         for name in &s.resolved.sinks {
             sinks.push((name.clone(), make_sink(s, name)?));
         }
-        let clipped = render_stream(s, &backend, &mut |samples| {
+        let (clipped, fits) = render_stream(s, &backend, &mut |samples| {
             for (_, sink) in &mut sinks {
                 write(sink, samples)?;
             }
             Ok(())
         })?;
+        log.insert(s.resolved.id.clone(), fits);
         let rate = output_rate(s)?;
         for (name, sink) in sinks {
             let (path, count, sha) = finish(sink)?;
@@ -379,7 +463,7 @@ fn render_all<S>(
             });
         }
     }
-    Ok(outputs)
+    Ok((outputs, log))
 }
 
 fn write_samples_sigmf(w: &mut SigmfWriter, s: &Samples) -> Result<(), RunError> {
@@ -517,7 +601,7 @@ pub fn run_offline(
     let epoch = (plan.resolved.epoch_unix_seconds, plan.resolved.epoch_nanos);
     let name = plan.resolved.name.clone();
 
-    let outputs = render_all(
+    let (outputs, geometry) = render_all(
         &plan,
         options,
         |s, sink| {
@@ -553,7 +637,7 @@ pub fn run_offline(
         },
     )?;
 
-    let truth = canonical_json(&truth_record(&plan)?);
+    let truth = canonical_json(&truth_record(&plan, &geometry)?);
     let truth_path = run_dir.join("truth.json");
     fs::write(&truth_path, &truth).map_err(|e| io_err(&truth_path, e))?;
 
@@ -676,7 +760,7 @@ pub fn replay(manifest_path: &Path, options: RunOptions) -> Result<ReplayReport,
 
     // Every input checks out: re-render into hashing sinks.
     let plan = RunPlan::new(loaded.resolved)?;
-    let outputs = render_all(
+    let (outputs, geometry) = render_all(
         &plan,
         options,
         |s, sink| {
@@ -704,7 +788,7 @@ pub fn replay(manifest_path: &Path, options: RunOptions) -> Result<ReplayReport,
             });
         return Err(RunError::Replay(format!("{which} re-rendered differently")));
     }
-    let truth = canonical_json(&truth_record(&plan)?);
+    let truth = canonical_json(&truth_record(&plan, &geometry)?);
     if sha256_hex(&truth) != m.truth.sha256 {
         return Err(RunError::Replay("the truth record differs".to_owned()));
     }

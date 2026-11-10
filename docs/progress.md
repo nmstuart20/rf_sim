@@ -664,3 +664,104 @@ Append one entry per prompt. Newest at the bottom. Each entry covers what was bu
 - **Stops:** derived attitude needs ≥ 0.1 m/s and maneuvers ≥ 1 m/s, so ground vehicles cannot stop yet; a held-heading mode at rest would be needed.
 - **Terrain clamp (prompt 22):** the clamped height must be C2 along the path; bilinear DTED is only C0, so it will need smoothing or a C2 interpolant.
 - **Wind** is constant and horizontal; gusts and wind fields are out of scope.
+
+---
+
+## Prompt 9: Light time and per-block polynomial fitting (2026-11-09)
+
+**Built** (contracts §14)
+
+- `iqsim-geo::light_time` (written by Codex CLI to my spec in a separate git worktree, reviewed, unchanged):
+  - `solve_receive`: |r_rx(t) − r_tx(t − τ)| = cτ in ECI by fixed-point iteration, each endpoint rotated at its own instant. It stops at |Δτ| ≤ max(10⁻¹⁶ s, 4 ulp), at most 10 updates, then re-evaluates the transmitter so τ, range and states agree.
+  - `tau_rate` = dτ/dt in closed form.
+  - `solve_emit`: the forward solve, which maps transmitter knots to receive time.
+  - `instant_offset` / `seconds_to_q64_ps`: t − τ in Q64.64 ps, so no absolute time meets a float product.
+- `iqsim-geo::trajectory::Lookback` (Codex, same worktree): 1 s second-order extrapolation before a span start, C2, with the start reported as a knot. Also `Static::from_ecef`.
+- `iqsim-runtime::geometry`, the fitter:
+  - The exact model per sample at ClockMap instants: delay τ·F_s; phase `phase_at(f_off, t) − carrier_phase(f_e, τ)`, both exact modular integers; the exact Q32.32 waveform coordinate; Friis amplitude at c·τ; for CW, |H(f_inst)| at the Doppler-shifted offset and the group delay applied exactly (the geometry at t − τ_g).
+  - Pulses and continuous sources are filtered at each segment's Doppler-shifted offset, on a tolerance grid; tables and kernels are cached by key.
+  - Cubic interpolation on the Chebyshev–Lobatto nodes u = 0, ¼, ¾, 1, then fixed-point conversion. D0 is exact for phase and coordinate.
+  - Checks at 15 points: the ends, the nodes, the nodal polynomial's three extrema and the odd sixteenths. Acceptance is at ¼ of each budget.
+  - On a miss the interval is halved, up to 12 times; then `FitError::Budget`.
+  - Splits at receiver knots and at transmitter knots mapped to receive time.
+  - `PathFit` carries the segments with residuals and the splits.
+- `iqsim-runtime::scene` replaces `static_scene`:
+  - `Scene` / `SceneEmitter` on `Arc<dyn Trajectory>`; `StaticScene` converts to it.
+  - `SceneBuilder` (alias `StaticSceneBuilder`) fits every path per block, culls per segment, and proves headroom with the largest segment bound per path.
+  - Continuous windows cover all segments, and each segment is rebased to the window origin.
+  - `build_block_logged` returns the fit log.
+- `iqsim-worklist`: `PathSegment.first/len`, a segment range within the block with segment-local polynomials (240 → 248 bytes). `coordinate_is_monotone` (exact checked i128 ends, and the step quadratic's minimum at the ends and the vertex) replaces the linear-only coordinate rule. The work-list hash is v2.
+- `iqsim-render`: the kernel renders each segment's part of a chunk.
+- `iqsim-runtime` resolution and run:
+  - Every trajectory is built until the run end (`trajectory::build_until` extends a plan that ends early, straight and level).
+  - `ResolvedScenario.platforms` holds kind, span, knot count and a state fingerprint (`RESOLVER_VERSION` 3).
+  - Emitters and streams name their `platform`. The built trajectories travel in a `#[serde(skip)]` field.
+  - `sim run` renders moving platforms.
+  - Truth schema 2: light-time range, range rate, Doppler, emission instant, the response gain at the Doppler-shifted offset, and `geometry_fit` (blocks, segments, worst residuals, every split).
+- `examples/moving.toml`: an aircraft CW emitter at FL100 turning near a ground site. `sim lint`, `sim run` and `sim replay` work on it.
+- Tests: geo 7 (Codex, `tests/light_time.rs`); worklist 1 new and 1 extended; render 1; runtime 2 unit, 3 in `tests/geometry.rs`, 1 in `tests/moving.rs`, and updated static, IQ-file, validation and trajectory tests. Measured:
+  - **Moving CW against the analytic solution:** uniform ECI motion at 7.5 km/s passing 50 km overhead, 2.2 GHz, Doppler −12.5 to +26.4 kHz, closed-form light time in the test. Rendered phase within **1.8·10⁻⁷ rad** at every sample of six blocks through closest approach (bound 0.01 rad). Frequency over 1 ms windows within 2.2·10⁻⁵ Hz.
+  - **LEO pass:** a circular 550 km orbit passing overhead, 10 GHz, 4 s blocks at 1 MS/s, a CW and a pulse emitter. Every block refines: 3090 refinement splits, most on the pulse path, whose 14 kHz Doppler sweep per block must stay within the 8.7 Hz table tolerance. At ≥ 98 points per segment, against an independent light-time reference, the worst errors are delay 5.2·10⁻⁹ samples, phase 3.3·10⁻⁴ rad, coordinate 1.0·10⁻⁹ samples and amplitude 7.3·10⁻⁸.
+  - **Review regressions:** a CW sweep through a 100/200 Hz edge stays within 0.23 of the amplitude budget at every sample; τ_g = 1 ms CW phase at 31 GHz LEO within 1.0·10⁻⁶ rad of the delayed trajectory, where the first-order fold misses 0.029 rad; a Doppler-shifted (775.5 kHz) pulse at its Friis level within 2·10⁻⁷ dB; a moving receiver whose plan ends in the final block, with a clock offset, renders; ±100-day coordinate intervals; interior delay extrema; light-time first guesses inside the span.
+  - **Knot splits:** for an aircraft whose turn knots fall inside 2 ms blocks, each transmitter-knot split is the first sample whose emission time is at or after the knot. Block 0 hears emissions from before the flight starts (look-back).
+  - **Thread independence:** output is identical across 1, 3 and 8 threads and chunk lengths 777 and 1. Rebuilding gives identical work-list hashes. A path split into shifted-register segments renders bit-identically to the whole.
+  - **Light time** (Codex): equatorial Earth-fixed pairs against an independent bisection, including the Sagnac sign in both directions and at 100 days. Uniform ECI motion against the closed-form root: worst **5.6·10⁻¹⁸ s**, τ̇ within 2.8·10⁻¹³, 3 updates for LEO and GEO.
+  - **Moving example end to end:** the antenna-port tone sits at 200 455.598 Hz against a truth Doppler of +455.584 Hz (0.014 Hz apart). The block-5 transmitter-knot split is in truth, and replay matches.
+  - **Static checks with the ECI reference (Sagnac included):** pulse TOA worst 2.7·10⁻⁶ samples (receiver chain 3.7·10⁻⁵); CW level 4·10⁻⁸ relative; band-limited pulse against Simpson 3.7·10⁻⁶·V in band and 4.5·10⁻⁶·V at −60 MHz; chirp direct sum 1.7·10⁻⁷ of peak.
+
+**Golden hashes (re-blessed with `cargo xtask bless`, each explained)**
+
+- `render/static_scene`, `runtime/iq_file_rx_ch0`, `runtime/iq_file_port`, `runtime/minimal_rx_ch0`: these are sample changes. `render/static_scene` changed a second time after the review: its H_rx has τ_g = 1 µs, and the CW group delay is now applied by evaluating the geometry at t − τ_g instead of adding −f·τ_g in f64. Light time is now solved in ECI, so a static east–west link gains the Sagnac term: +155 ps, ≈ 1.06 rad at 1090 MHz, on the 30 km test link. Phase D0 now comes from the exact integer `carrier_phase` instead of an f64 product, and amplitudes are fitted from c·τ. Every physics check above still passes, against the independent ECI reference.
+- `runtime/minimal_port` is unchanged: the minimal example's link runs north–south on one meridian (−77.0365°), its Sagnac term is −0.005 ps (3.6·10⁻⁵ rad), and the remaining differences stay below one sc16 code.
+- `runtime/minimal_truth`, `runtime/iq_file_truth`: truth schema 2 (light-time range, Doppler, emission instant, `geometry_fit`).
+- New: `runtime/moving_rx_ch0`, `runtime/moving_port`, `runtime/moving_truth`.
+
+**Contracts changed** (numeric contract still version 0: §10 decision 9 is open)
+
+- New §14 (light time, look-back, exact model, nodes, checks, acceptance, refinement, knot splits, culling and headroom per segment, fit log, trajectory fingerprints).
+- §5.2: segment fields and kernel, and the monotone cubic coordinate rule.
+- §6: resolver 3 and truth schema 2.
+- §9: placements.
+- §10: decision 10 settled, and the Doppler and phase check marked tested.
+- §11.4: `sim run` renders moving platforms.
+
+**Decisions and deviations**
+
+- **Look-back (decided with the user): extrapolate.** The alternatives were a required earlier start, or silence before the start. Transmitters get a 1 s C2 Taylor extrapolation before their span start; receivers are not wrapped.
+- **Refinement policy:** conservative adaptive refinement (dense checks including the nodal polynomial's extrema, a 4× margin, halving), not derivative bounds. A rigorous bound would need f⁽⁴⁾ of the light-time function through Earth rotation and, from prompt 10, attitude-dependent phase centres. The margin and its assumption (f⁽⁴⁾ varying by less than 4× per interval) are stated in §14.3.
+- **Splitting is per block.** A path in a long block becomes several work-list segments. That needed a segment range in `PathSegment`, a layout change the CUDA port (prompt 20) inherits.
+- **Amplitude is fitted and checked already** (Friis at c·τ and the CW fold), not left for prompt 10. Phase is checked at every point until prompt 10 brings null floors.
+- **The CW response fold uses the Doppler-shifted offset, and the group delay exactly.** With τ_g = 1 µs, the LEO Doppler term alone would be 0.16 rad, above budget; with τ_g = 1 ms the first-order fold itself misses 0.03 rad (review).
+- **Pulse and continuous responses at the Doppler-shifted offset (review).** Tables and kernels are keyed per segment, on a grid of half the tolerance, and built lazily. The tolerance is conservative (global max|H′|), so a fast mover in long blocks refines a lot: 3090 splits in the 4 s LEO test. 1 ms blocks need none.
+- **Prompt 5's 2⁴⁰-cycle propagation-phase limit is gone** (`carrier_phase` is exact). A 10¹⁵ m link now fails at the light-time range (|τ| ≤ 10⁶ s) when its block is built; the test was updated.
+- **Trajectories are not serialized** into the resolved scenario. They are rebuilt from the verified scenario file, and their fingerprints are compared. The trajectory map's `PartialEq` compares names only, because the fingerprints in `platforms` carry the content.
+- **Flights that end before the run continue straight and level.** Before this, rendering past a plan's end would have been an `OutsideSpan` error.
+- `NonLinearClock` is gone: the fitter checks any clock map against its own instants.
+- **Transmitter carrier offsets:** there is no emitter oscillator model yet; the transmitter carrier is f_e evaluated at emission time. Receiver LO offsets stay in the chain (stage 3) at acquisition instants.
+
+**Dependencies**
+
+- No new external crates and no new internal edges (`cargo xtask deps` passes). `iqsim-testkit` is still a dev-dependency only.
+
+**Open questions**
+
+- **V_ref logging.** §2 asks for a per-block V_ref logged with the residuals; it arrives with antenna gains (prompt 10), where the null floor first matters.
+- **Truth size.** A long LEO run at long blocks logs a split list every block. A summary-only mode may be wanted for multi-hour runs.
+- **Fit cost.** Every interval costs 19 light-time solves (4 nodes, 15 checks), and every halving adds more. That is fine offline; the real-time budget (phase 5) may want fewer checks on intervals with a proven derivative bound.
+- **Continuous sources with refined segments** share one window per (block, kernel key); a very fast mover in a long block widens it. `WindowTooLong` still guards the size.
+- **Doppler table tolerance.** It uses the global max|H′|; a bound over the band where the emission actually has energy would refine far less for in-band signals.
+
+**Independent review (Codex CLI, `high` reasoning, read-only)**
+
+- Codex also wrote `light_time.rs`, `lookback.rs` and their tests to my spec in a separate git worktree. I reviewed them and brought them in unchanged. One review finding (below) then changed the solver's first guess.
+- The review found five P1 and three P2 issues. All are fixed, each with a regression test:
+  - **P1, checks missed a response sweep.** A CW Doppler sweep through a sharp response edge could be zero at every check point and in band between them. f_inst may now move at most σ/8 between adjacent checks.
+  - **P1, interior delay wrap.** Only nodes were range-checked; the fitted cubic's extrema are now checked too.
+  - **P1, CW group delay to first order.** −f_inst·τ_g missed ½τ_g²φ̈ (0.03 rad at 31 GHz LEO with τ_g = 1 ms). CW geometry is now evaluated at t − τ_g.
+  - **P1, Doppler ignored by pulse and continuous filtering.** Tables and kernels were at the nominal offset; they are now at each segment's Doppler-shifted offset, within a tolerance that drives refinement.
+  - **P1, coordinate interval overflow.** Instants ±100 days apart overflowed one Q64.64 subtraction; the interval is now split into whole ps and the fraction.
+  - **P2, `stop` checked on the fitted coordinate.** It is now checked on the exact one.
+  - **P2, trajectories not covering the last block.** They are now extended past the final rendered block and clock offsets.
+  - **P2, light-time first guess outside the span.** It is now clamped into the moving endpoint's span.
+- I also found and fixed a cost problem while fixing the above: activity tests built tables at every segment offset, and the LEO test took 9 minutes. They now use the nominal tables with a one-sample margin.
+- It found no issues in the work-list monotonicity check, the kernel's segment handling, per-segment culling and headroom, the trajectory fingerprints or the truth record.

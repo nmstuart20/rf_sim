@@ -1,6 +1,6 @@
 //! Scenario trajectories (prompt 8): every kind in `examples/trajectories.toml` builds
-//! into an `iqsim-geo` trajectory with the expected behavior, and `sim run` refuses
-//! moving platforms until the light-time geometry engine (prompt 9).
+//! into an `iqsim-geo` trajectory with the expected behavior, and `sim run` resolves
+//! and fingerprints every one of them (prompt 9).
 
 #![forbid(unsafe_code)]
 
@@ -81,13 +81,22 @@ fn every_example_trajectory_builds() {
 }
 
 #[test]
-fn sim_run_refuses_moving_platforms() {
+fn sim_run_resolves_every_moving_platform() {
+    // Prompt 8 refused moving platforms here; since prompt 9 they are built until the
+    // run ends and fingerprinted in the resolved scenario.
     let out = std::env::temp_dir().join(format!("iqsim-traj-{}", std::process::id()));
-    let e = run_offline(&example(), &out, RunOptions::default()).unwrap_err();
-    let m = e.to_string();
-    assert!(
-        m.contains("platform \"ac1\": moving platforms are not rendered yet"),
-        "{m}"
-    );
+    let _ = std::fs::remove_dir_all(&out);
+    let m = run_offline(&example(), &out, RunOptions::default()).unwrap();
+    let platforms = m.scenario.resolved["platforms"].as_array().unwrap();
+    let kinds: Vec<&str> = platforms
+        .iter()
+        .map(|p| p["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["static", "maneuvers", "route", "track", "ground"]);
+    for p in platforms {
+        assert_eq!(p["trajectory_sha256"].as_str().unwrap().len(), 64);
+    }
+    assert!(platforms[0]["span_start_ps"].is_null());
+    assert_eq!(platforms[1]["span_start_ps"], 0);
     let _ = std::fs::remove_dir_all(out);
 }

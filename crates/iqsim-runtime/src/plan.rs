@@ -30,15 +30,17 @@
 //! - Receiver entity ids are the first four bytes (little-endian) of
 //!   SHA-256(`"iqsim.entity.v1\0"` ‖ name), so they do not depend on file order.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use iqsim_core::amplitude::{LOSSLESS_CULL_LSB, rms_volts};
 use iqsim_core::{
     ChannelTimebase, IdealClockMap, MAX_BLOCK_LEN, ResponseSpec, SampleRate, TapKind, TapResponse,
     TargetScale, TruthTime,
 };
-use iqsim_geo::{AltitudeModel, Atmosphere, Ecef, Geoid, GeoidGrid};
+use iqsim_geo::{AltitudeModel, Atmosphere, Geoid, GeoidGrid, Trajectory};
 use iqsim_io::iq_input::IqInput;
 use iqsim_receiver::{
     AdcConfig, AgcConfig, ChainConfig, DecimationConfig, FrontEnd, IqImpairment, LoConfig,
@@ -48,14 +50,14 @@ use iqsim_scenario::{
     ClockModel, EndPolicySpec, IqFileSpec, LoModel, NormalizationSpec, ResponseDetail,
     SampleFormatSpec, Scenario, SinkKind, TrajectoryKind,
 };
-use iqsim_units::{Frequency, Position};
+use iqsim_units::Frequency;
 use iqsim_waveform::continuous::source_response;
 use iqsim_waveform::{EndPolicy, SourceTimeline};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::static_scene::{
-    ContinuousSpec, SharedSource, StaticEmitter, StaticScene, StaticTarget, StaticWaveform,
+use crate::scene::{
+    ContinuousSpec, Scene, SceneEmitter, SharedSource, StaticTarget, StaticWaveform,
 };
 
 /// Pages an IQ-file reader may cache (64 MiB at 1 MiB per page).
@@ -179,7 +181,9 @@ pub struct ResolvedChain {
 pub struct ResolvedEmitter {
     /// Name.
     pub name: String,
-    /// ECEF position, m.
+    /// Platform name (its trajectory carries the emitter).
+    pub platform: String,
+    /// ECEF position at truth time 0 (or the trajectory start, if later), m.
     pub position_ecef_m: [f64; 3],
     /// Carrier, µHz.
     pub carrier_uhz: i64,
@@ -354,7 +358,9 @@ pub struct ResolvedStream {
     pub entity_id: u32,
     /// Channel index within the receiver.
     pub channel_index: u16,
-    /// ECEF position of the antenna, m.
+    /// Platform name (its trajectory carries the antenna).
+    pub platform: String,
+    /// ECEF position of the platform at truth time 0 (or its trajectory start), m.
     pub position_ecef_m: [f64; 3],
     /// Centre, µHz.
     pub center_uhz: i64,
@@ -450,10 +456,116 @@ pub struct ResolvedScenario {
     pub block_ps: i64,
     /// Earth model.
     pub world: ResolvedWorld,
+    /// Platforms, in file order, with their trajectory fingerprints.
+    pub platforms: Vec<ResolvedPlatform>,
     /// Emitters, in file order.
     pub emitters: Vec<ResolvedEmitter>,
     /// Streams: receiver channels in file order, then antenna ports.
     pub streams: Vec<ResolvedStream>,
+    /// The built trajectories by platform name. Not serialized: they are derived from
+    /// the scenario and the Earth model, and [`ResolvedPlatform::trajectory_sha256`]
+    /// identifies each one in the canonical form.
+    #[serde(skip)]
+    pub trajectories: Trajectories,
+}
+
+/// The run's trajectories by platform name. Equality compares the names only; the
+/// fingerprints in [`ResolvedScenario::platforms`] compare the content.
+#[derive(Clone, Debug, Default)]
+pub struct Trajectories(pub BTreeMap<String, Arc<dyn Trajectory>>);
+
+impl PartialEq for Trajectories {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.keys().eq(other.0.keys())
+    }
+}
+
+/// One resolved platform.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResolvedPlatform {
+    /// Name.
+    pub name: String,
+    /// Trajectory kind: `static`, `maneuvers`, `route`, `track` or `ground`.
+    pub kind: String,
+    /// Trajectory span start, ps (absent: unbounded).
+    pub span_start_ps: Option<i64>,
+    /// Trajectory span end, ps (absent: unbounded).
+    pub span_end_ps: Option<i64>,
+    /// Knots (jerk discontinuities) from the evaluated start to the run end.
+    pub knots: u64,
+    /// SHA-256 over the states at the evaluated start, every knot and the run end
+    /// (module docs).
+    pub trajectory_sha256: String,
+}
+
+/// Lookback before a trajectory start that light time may evaluate (prompt 9).
+const FINGERPRINT_LOOKBACK_PS: i64 = 1_000_000_000_000;
+
+/// The platform record: span, knot count, and the fingerprint
+/// `SHA-256("iqsim.trajectory-fingerprint.v1\0" ‖ for each instant: ps (i64 LE) ‖
+/// position, velocity, acceleration, q_ecef_body (w, x, y, z), angular rate as f64
+/// bits LE)` over the instants max(span start, −1 s), every knot up to the run end,
+/// and the run end.
+fn resolved_platform(
+    name: &str,
+    kind: TrajectoryKind,
+    t: &dyn Trajectory,
+    until: TruthTime,
+) -> Result<ResolvedPlatform, ResolveError> {
+    let span = t.span();
+    let from = span
+        .start
+        .unwrap_or(TruthTime::MIN)
+        .max(TruthTime::from_ps(-FINGERPRINT_LOOKBACK_PS));
+    let to = span.end.unwrap_or(TruthTime::MAX).min(until);
+    let knots = t.knots(from, to);
+    let mut h = Sha256::new();
+    h.update(b"iqsim.trajectory-fingerprint.v1\0");
+    let mut instants = vec![from];
+    instants.extend(knots.iter().copied().filter(|&k| k > from && k < to));
+    instants.push(to);
+    for at in instants {
+        let st = t
+            .state_at(at)
+            .map_err(|e| ResolveError(format!("platform \"{name}\": {e}")))?;
+        h.update(at.as_ps().to_le_bytes());
+        let q = st.q_ecef_body;
+        for v in [
+            st.position.x,
+            st.position.y,
+            st.position.z,
+            st.velocity.x,
+            st.velocity.y,
+            st.velocity.z,
+            st.acceleration.x,
+            st.acceleration.y,
+            st.acceleration.z,
+            q.w,
+            q.x,
+            q.y,
+            q.z,
+            st.angular_rate_body.x,
+            st.angular_rate_body.y,
+            st.angular_rate_body.z,
+        ] {
+            h.update(v.to_bits().to_le_bytes());
+        }
+    }
+    Ok(ResolvedPlatform {
+        name: name.to_owned(),
+        kind: match kind {
+            TrajectoryKind::Static => "static",
+            TrajectoryKind::Maneuvers => "maneuvers",
+            TrajectoryKind::Route => "route",
+            TrajectoryKind::Track => "track",
+            TrajectoryKind::Ground => "ground",
+        }
+        .to_owned(),
+        span_start_ps: span.start.map(TruthTime::as_ps),
+        span_end_ps: span.end.map(TruthTime::as_ps),
+        knots: knots.len() as u64,
+        trajectory_sha256: hex::encode(h.finalize()),
+    })
 }
 
 /// Receiver entity id from its name (module docs).
@@ -463,21 +575,6 @@ pub fn entity_id(name: &str) -> u32 {
     h.update(name.as_bytes());
     let d = h.finalize();
     u32::from_le_bytes([d[0], d[1], d[2], d[3]])
-}
-
-fn ecef(position: &Position, model: &AltitudeModel, what: &str) -> Result<[f64; 3], ResolveError> {
-    let alt = position.altitude();
-    let (lat, lon) = (
-        position.latitude().degrees(),
-        position.longitude().degrees(),
-    );
-    let (lat_rad, lon_rad) = (lat.to_radians(), lon.to_radians());
-    let geo = |e: iqsim_geo::GeoError| ResolveError(format!("{what}: {e}"));
-    let h = model
-        .ellipsoid_height_m(lat_rad, lon_rad, alt)
-        .map_err(geo)?;
-    let e = Ecef::from_geodetic(lat, lon, h);
-    Ok([e.x, e.y, e.z])
 }
 
 /// `num·10⁶/den` floored: a rate in µHz.
@@ -564,24 +661,6 @@ fn format_of(
     Ok((f.to_owned(), names))
 }
 
-fn platform_position(
-    scenario: &Scenario,
-    model: &AltitudeModel,
-    name: &str,
-    owner: &str,
-) -> Result<[f64; 3], ResolveError> {
-    let p = scenario
-        .platforms
-        .iter()
-        .find(|p| p.name.as_str() == name)
-        .ok_or_else(|| ResolveError(format!("{owner}: unknown platform \"{name}\"")))?;
-    let position = p
-        .position
-        .as_ref()
-        .ok_or_else(|| ResolveError(format!("{owner}: platform \"{name}\" has no position")))?;
-    ecef(position, model, owner)
-}
-
 /// Resolves a parsed, lint-clean scenario. Relative input paths are taken from
 /// `base`, the scenario file's directory.
 pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, ResolveError> {
@@ -597,17 +676,49 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
         return err("render duration and block must be positive");
     }
     let (world, model) = resolve_world(scenario, base)?;
+    // Every trajectory, built until the last instant the run evaluates (a plan that
+    // ends earlier continues straight and level), with a fingerprint of what it
+    // evaluates to. The last block is fitted whole and a clock offset moves sampling
+    // instants later (review fix: extending to the nominal duration left the final
+    // block's tail outside the span), so the margin is one block plus the largest
+    // clock offset plus 1 ms.
+    let clock_margin = scenario
+        .receivers
+        .iter()
+        .flat_map(|r| &r.channels)
+        .filter(|c| c.clock.model == ClockModel::FixedOffset)
+        .filter_map(|c| c.clock.offset.as_ref().map(|o| o.get_ref().get().as_ps()))
+        .fold(0_i64, i64::max);
+    let until = TruthTime::from_ps(
+        duration_ps
+            .checked_add(block_ps)
+            .and_then(|t| t.checked_add(clock_margin))
+            .and_then(|t| t.checked_add(1_000_000_000))
+            .ok_or_else(|| ResolveError("the run end overflows truth time".to_owned()))?,
+    );
+    let mut platforms = Vec::new();
+    let mut trajectories = Trajectories::default();
     for p in &scenario.platforms {
-        // Build every trajectory so its errors surface, then refuse motion: the static
-        // geometry below cannot render it (prompt 9 replaces it).
-        crate::trajectory::build(p, &model)?;
-        if p.trajectory.kind != TrajectoryKind::Static {
-            return err(format!(
-                "platform \"{}\": moving platforms are not rendered yet (`sim run` supports static platforms until the light-time geometry engine, prompt 9)",
-                p.name.as_str()
-            ));
-        }
+        let name = p.name.as_str().to_owned();
+        let t = crate::trajectory::build_until(p, &model, until)?;
+        platforms.push(resolved_platform(&name, p.trajectory.kind, &*t, until)?);
+        trajectories.0.insert(name, t);
     }
+    let position_of = |name: &str, owner: &str| -> Result<[f64; 3], ResolveError> {
+        let t = trajectories
+            .0
+            .get(name)
+            .ok_or_else(|| ResolveError(format!("{owner}: unknown platform \"{name}\"")))?;
+        let at = t
+            .span()
+            .start
+            .unwrap_or(TruthTime::EPOCH)
+            .max(TruthTime::EPOCH);
+        let st = t
+            .state_at(at)
+            .map_err(|e| ResolveError(format!("{owner}: platform \"{name}\": {e}")))?;
+        Ok([st.position.x, st.position.y, st.position.z])
+    };
 
     let mut emitters = Vec::new();
     for e in &scenario.emitters {
@@ -629,7 +740,8 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
         };
         emitters.push(ResolvedEmitter {
             name: e.name.as_str().to_owned(),
-            position_ecef_m: platform_position(scenario, &model, e.platform.as_str(), &owner)?,
+            platform: e.platform.as_str().to_owned(),
+            position_ecef_m: position_of(e.platform.as_str(), &owner)?,
             carrier_uhz: e.frequency.get_ref().as_micro_hz(),
             power_w: e.power.watts(),
             waveform: waveform.to_owned(),
@@ -648,9 +760,7 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
             ));
         }
         ids.push((id, r.name.as_str().to_owned()));
-        let position = platform_position(
-            scenario,
-            &model,
+        let position = position_of(
             r.platform.as_str(),
             &format!("receiver \"{}\"", r.name.as_str()),
         )?;
@@ -746,6 +856,7 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
                 r.name.as_str(),
                 id,
                 ci,
+                r.platform.as_str(),
                 position,
                 c.center_frequency.get_ref().as_micro_hz(),
                 rate,
@@ -772,7 +883,8 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
             a.name.as_str(),
             0,
             0,
-            platform_position(scenario, &model, a.platform.as_str(), &owner)?,
+            a.platform.as_str(),
+            position_of(a.platform.as_str(), &owner)?,
             a.center_frequency.get_ref().as_micro_hz(),
             rate,
             block_ps,
@@ -794,13 +906,16 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
         duration_ps,
         block_ps,
         world,
+        platforms,
         emitters,
         streams,
+        trajectories,
     })
 }
 
-/// Resolution rules version (2 since prompt 7: the Earth model).
-pub const RESOLVER_VERSION: u32 = 2;
+/// Resolution rules version (2 since prompt 7: the Earth model; 3 since prompt 9:
+/// platforms and their trajectories).
+pub const RESOLVER_VERSION: u32 = 3;
 
 /// Reads the geoid grid (if any) and builds the altitude model.
 fn resolve_world(
@@ -860,6 +975,7 @@ fn stream(
     entity: &str,
     entity_id: u32,
     channel_index: usize,
+    platform: &str,
     position_ecef_m: [f64; 3],
     center_uhz: i64,
     rate: SampleRate,
@@ -891,6 +1007,7 @@ fn stream(
         entity_id,
         channel_index: u16::try_from(channel_index)
             .map_err(|_| ResolveError(format!("{owner}: too many channels")))?,
+        platform: platform.to_owned(),
         position_ecef_m,
         center_uhz,
         rate_num: rate.num(),
@@ -912,7 +1029,7 @@ pub struct StreamPlan {
     /// The resolved stream.
     pub resolved: ResolvedStream,
     /// The scene seen from this stream's antenna.
-    pub scene: StaticScene,
+    pub scene: Scene,
     /// The render target.
     pub target: StaticTarget,
     /// The stream's ClockMap.
@@ -942,18 +1059,19 @@ pub struct RunPlan {
 impl RunPlan {
     /// Builds runtime objects from a resolved scenario.
     pub fn new(resolved: ResolvedScenario) -> Result<Self, ResolveError> {
-        let mut emitters: Vec<StaticEmitter> = Vec::new();
+        let trajectory = |name: &str, owner: &str| {
+            resolved.trajectories.0.get(name).cloned().ok_or_else(|| {
+                ResolveError(format!("{owner}: platform \"{name}\" has no trajectory"))
+            })
+        };
+        let mut emitters: Vec<SceneEmitter> = Vec::new();
         for e in &resolved.emitters {
             let waveform = match &e.source {
                 None => StaticWaveform::Cw,
                 Some(src) => StaticWaveform::Continuous(open_source(src, &e.name)?),
             };
-            emitters.push(StaticEmitter {
-                position: Ecef::new(
-                    e.position_ecef_m[0],
-                    e.position_ecef_m[1],
-                    e.position_ecef_m[2],
-                ),
+            emitters.push(SceneEmitter {
+                trajectory: trajectory(&e.platform, &format!("emitter \"{}\"", e.name))?,
                 carrier_uhz: e.carrier_uhz,
                 power_w: e.power_w,
                 waveform,
@@ -993,11 +1111,10 @@ impl RunPlan {
                 ),
                 None => None,
             };
-            let p = s.position_ecef_m;
             streams.push(StreamPlan {
                 resolved: s.clone(),
-                scene: StaticScene {
-                    receiver: Ecef::new(p[0], p[1], p[2]),
+                scene: Scene {
+                    receiver: trajectory(&s.platform, &owner)?,
                     emitters: emitters.clone(),
                 },
                 target,

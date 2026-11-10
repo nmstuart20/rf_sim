@@ -24,6 +24,7 @@
 pub mod attitude;
 mod earth;
 mod flight;
+mod lookback;
 pub mod piece;
 pub mod profile;
 mod route;
@@ -47,6 +48,7 @@ pub use flight::{
     ClimbEnd, ClimbRate, Flight, Limits, Primitive, Start, TrackPoint, TurnDirection, TurnEnd,
     TurnRate, Waypoint,
 };
+pub use lookback::{Lookback, MAX_LOOKBACK};
 
 /// The kinematic state of a platform at one instant.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -185,6 +187,20 @@ pub struct Static {
 }
 
 impl Static {
+    /// A static platform with an exact ECEF position and ECEF attitude, without a
+    /// geodetic round trip or quaternion normalization.
+    pub const fn from_ecef(position: Ecef, q_ecef_body: Quat) -> Self {
+        Self {
+            state: State {
+                position,
+                velocity: Vec3::ZERO,
+                acceleration: Vec3::ZERO,
+                q_ecef_body,
+                angular_rate_body: Vec3::ZERO,
+            },
+        }
+    }
+
     /// A static platform at `position` with attitude `q_ned_body`.
     pub fn new(position: Geodetic, q_ned_body: Quat) -> Self {
         let pose = PlatformPose::new(position, q_ned_body);

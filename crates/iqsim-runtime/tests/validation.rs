@@ -8,6 +8,8 @@
 //! comes from `TapResponse::magnitude`, which is the definition of the response
 //! (checked against the impulse response's Fourier transform in prompt 5).
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -22,7 +24,7 @@ use iqsim_receiver::{
     AdcConfig, ChainConfig, FrontEnd, OutputFormat, ReceiverChannelState, Samples,
 };
 use iqsim_render::{Backend, CpuBackend};
-use iqsim_runtime::static_scene::{
+use iqsim_runtime::scene::{
     PulseSpec, StaticEmitter, StaticScene, StaticSceneBuilder, StaticTarget, StaticWaveform,
 };
 use iqsim_runtime::{RunError, RunOptions, replay, run_offline};
@@ -467,7 +469,9 @@ fn pulse_time_of_arrival_survives_the_receiver_chain() {
     };
     let rx = [6_378_137.0, 0.0, 0.0];
     let em = [6_378_137.0, 30_000.0, 0.0];
-    let tau = dist(rx, em) / C;
+    // The ECI light time, Sagnac included (≈ 155 ps more than the ECEF distance / c).
+    let tau = common::eci_delay(rx, em);
+    assert!((tau - dist(rx, em) / C).abs() < 1e-9);
     let clock = IdealClockMap::new(ChannelTimebase::new(TruthTime::from_ps(0), rate));
     let v_adc = 1e-3;
     let target = StaticTarget {

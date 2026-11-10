@@ -20,6 +20,10 @@
 //! platforms, maneuver primitives, waypoint routes, track replay, ground-clamped
 //! motion, derived attitude and runtime appends.
 //!
+//! Since prompt 9 (contracts §14): [`light_time`], the ECI light-time solver
+//! (receive and emit forms), and [`Lookback`], the C2 extrapolation before a
+//! trajectory's start that light time needs.
+//!
 //! All arithmetic is f64 with transcendentals from `libm`, so results are the same
 //! bits on every machine.
 //!
@@ -34,6 +38,7 @@ pub mod frames;
 pub mod geodetic;
 pub mod geoid;
 pub mod gillham;
+pub mod light_time;
 pub mod ned;
 pub mod quat;
 pub mod trajectory;
@@ -50,7 +55,7 @@ pub use geoid::{Geoid, GeoidGrid, GeoidGridMetadata};
 pub use gillham::GillhamCode;
 pub use ned::LocalNed;
 pub use quat::Quat;
-pub use trajectory::{Flight, Span, State, Static, Trajectory};
+pub use trajectory::{Flight, Lookback, MAX_LOOKBACK, Span, State, Static, Trajectory};
 pub use vec::{Mat3, Vec3};
 
 /// A geometry, geoid or altitude-chain failure.
@@ -99,6 +104,8 @@ pub enum GeoError {
     },
     /// A trajectory could not be built or evaluated (motion plan, attitude).
     Trajectory(String),
+    /// A light-time path or time offset is invalid.
+    LightTime(String),
 }
 
 impl fmt::Display for GeoError {
@@ -133,6 +140,7 @@ impl fmt::Display for GeoError {
                 "t = {t_ps} ps is outside the trajectory span [{start_ps}, {end_ps}] ps"
             ),
             Self::Trajectory(m) => write!(f, "trajectory: {m}"),
+            Self::LightTime(m) => write!(f, "light time: {m}"),
         }
     }
 }

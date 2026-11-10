@@ -4,6 +4,8 @@
 //! Friis and light time from the test's own geometry, the response's defining
 //! formula, and a direct quadrature of the band-limited pulse (no edge tables).
 
+mod common;
+
 use iqsim_core::amplitude::LOSSLESS_CULL_LSB;
 use iqsim_core::{
     BlockSpec, ChannelTimebase, IdealClockMap, ResponseSpec, SampleRate, TapKind, TapResponse,
@@ -11,7 +13,7 @@ use iqsim_core::{
 };
 use iqsim_geo::Ecef;
 use iqsim_render::{Backend, CpuBackend, RenderError};
-use iqsim_runtime::static_scene::{
+use iqsim_runtime::scene::{
     PulseSpec, SceneError, StaticEmitter, StaticScene, StaticSceneBuilder, StaticTarget,
     StaticWaveform,
 };
@@ -70,6 +72,11 @@ fn antenna_port() -> StaticTarget {
     }
 }
 
+/// The light time of the test link in ECI, Sagnac included (independent reference).
+fn link_tau() -> f64 {
+    common::eci_delay([6_378_137.0, 0.0, 0.0], [6_378_137.0, RANGE_M, 0.0])
+}
+
 fn receiver() -> Ecef {
     Ecef::new(6_378_137.0, 0.0, 0.0)
 }
@@ -85,7 +92,7 @@ fn emitter(carrier_uhz: i64, waveform: StaticWaveform) -> StaticEmitter {
 
 /// Independent Friis voltage at the receiver.
 fn friis_volts(carrier_hz: f64) -> f64 {
-    (POWER_W * 50.0).sqrt() * (C / carrier_hz) / (4.0 * PI * RANGE_M)
+    (POWER_W * 50.0).sqrt() * (C / carrier_hz) / (4.0 * PI * (C * link_tau()))
 }
 
 fn trapezoid(emission_ps: i64) -> StaticWaveform {
@@ -119,7 +126,7 @@ fn render_acc(builder: &StaticSceneBuilder<'_>, b: u64, backend: CpuBackend) -> 
 
 #[test]
 fn pulse_time_of_arrival_is_within_a_thousandth_of_a_sample() {
-    let tau = RANGE_M / C;
+    let tau = link_tau();
     let clock = clock();
     for target in [virtual_rx(), antenna_port()] {
         let gd = target.response.group_delay_ps as f64 * 1e-12;
@@ -201,7 +208,7 @@ fn reference_edge(resp: &TapResponse, f_off: f64, rise_s: f64, tau: f64) -> (f64
 
 #[test]
 fn pulses_match_an_independent_band_limited_reference() {
-    let tau = RANGE_M / C;
+    let tau = link_tau();
     let clock = clock();
     let target = virtual_rx();
     // In band (+3 MHz), and 1030 MHz interrogations 60 MHz below the channel: what
@@ -264,7 +271,7 @@ fn pulses_match_an_independent_band_limited_reference() {
 
 #[test]
 fn cw_tone_has_the_expected_frequency_level_and_phase_for_each_tap() {
-    let tau = RANGE_M / C;
+    let tau = link_tau();
     let clock = clock();
     for target in [virtual_rx(), antenna_port()] {
         for off_mhz in [0.0, 2.5, -4.0, 6.9, -7.2] {
@@ -409,7 +416,7 @@ fn lossless_culling_never_changes_output_bits() {
 
 fn busy_scene() -> StaticScene {
     let block_end_ps = 1_024_000_000;
-    let tau_ps = (RANGE_M / C * 1e12) as i64;
+    let tau_ps = (link_tau() * 1e12) as i64;
     let train = |emission_ps: i64| StaticWaveform::Pulses {
         emission: TruthTime::from_ps(emission_ps),
         pulses: (0..4)
@@ -568,7 +575,7 @@ fn a_rise_that_outlasts_the_fall_renders_the_same_in_any_chunking() {
         );
     }
     // The tail between the fall table's end and the rise table's end is non-zero.
-    let tau = RANGE_M / C;
+    let tau = link_tau();
     let k = ((300e-6 + tau + 1e-6 + 6e-6) * FS) as usize;
     assert!(whole[2 * k] != 0 || whole[2 * k + 1] != 0);
 }
@@ -610,9 +617,11 @@ fn headroom_covers_the_scaled_amplitude_intermediate() {
 }
 
 #[test]
-fn links_beyond_the_f64_propagation_phase_budget_are_rejected() {
-    // Regression (prompt 5 review): f_c·R/c at 10¹⁵ m is ≈ 3.6·10¹⁵ cycles, where f64
-    // no longer resolves the fractional cycle.
+fn links_beyond_the_light_time_range_fail_the_block() {
+    // Prompt 5 rejected f_c·R/c above 2⁴⁰ cycles because f64 could not resolve its
+    // fraction; the geometry engine computes that fraction exactly (`carrier_phase`).
+    // A 10¹⁵ m link is still rejected, by the light-time range (|τ| ≤ 10⁶ s), when the
+    // block is built.
     let clock = clock();
     let mut far = emitter(CENTER_UHZ, StaticWaveform::Cw);
     far.position = Ecef::new(6_378_137.0, 1e15, 0.0);
@@ -620,8 +629,15 @@ fn links_beyond_the_f64_propagation_phase_budget_are_rejected() {
         receiver: receiver(),
         emitters: vec![far],
     };
+    let builder =
+        StaticSceneBuilder::new(&scene, &virtual_rx(), &clock, BlockSpec::new(LEN).unwrap())
+            .unwrap();
     assert!(matches!(
-        StaticSceneBuilder::new(&scene, &virtual_rx(), &clock, BlockSpec::new(LEN).unwrap()),
-        Err(SceneError::Emitter { index: 0 })
+        builder.build_block(0),
+        Err(SceneError::Fit {
+            index: 0,
+            block: 0,
+            ..
+        })
     ));
 }

@@ -3,9 +3,11 @@
 //! [`build`] turns a platform's `[platforms.trajectory]` table into a
 //! [`Trajectory`]: a [`Static`] platform or a [`Flight`]. Scenario altitudes resolve
 //! through the run's [`AltitudeModel`] (geoid, atmosphere), and AGL heights over the
-//! ellipsoid, as everywhere until terrain exists. `sim run` still renders static
-//! platforms only; moving ones are built (so their errors surface) and then rejected
-//! by resolution until the light-time geometry engine (prompt 9).
+//! ellipsoid, as everywhere until terrain exists. [`build_until`] also extends a
+//! flight whose plan ends before the run does, straight and level
+//! ([`Flight::extend_to`]), so every platform is defined for the whole run.
+
+use std::sync::Arc;
 
 use iqsim_core::TruthTime;
 use iqsim_geo::altitude::AltitudeModel;
@@ -156,8 +158,26 @@ fn waypoint(lat: f64, lon: f64, alt: Altitude, speed: Option<f64>) -> Waypoint {
     }
 }
 
-/// The platform's trajectory (module docs). Expects a lint-clean scenario.
-pub fn build(p: &Platform, model: &AltitudeModel) -> Result<Box<dyn Trajectory>, ResolveError> {
+/// The platform's trajectory as planned (module docs). Expects a lint-clean scenario.
+pub fn build(p: &Platform, model: &AltitudeModel) -> Result<Arc<dyn Trajectory>, ResolveError> {
+    build_inner(p, model, None)
+}
+
+/// The platform's trajectory, extended straight and level to at least `until` if its
+/// plan ends earlier.
+pub fn build_until(
+    p: &Platform,
+    model: &AltitudeModel,
+    until: TruthTime,
+) -> Result<Arc<dyn Trajectory>, ResolveError> {
+    build_inner(p, model, Some(until))
+}
+
+fn build_inner(
+    p: &Platform,
+    model: &AltitudeModel,
+    until: Option<TruthTime>,
+) -> Result<Arc<dyn Trajectory>, ResolveError> {
     let owner = format!("platform \"{}\"", p.name.as_str());
     let owner = owner.as_str();
     let t = &p.trajectory;
@@ -213,7 +233,7 @@ pub fn build(p: &Platform, model: &AltitudeModel) -> Result<Box<dyn Trajectory>,
             let q = a.map_or(Quat::IDENTITY, |a| {
                 Quat::from_euler_zyx(angle(a.heading), angle(a.pitch), angle(a.roll))
             });
-            return Ok(Box::new(Static::new(position()?, q)));
+            return Ok(Arc::new(Static::new(position()?, q)));
         }
         TrajectoryKind::Maneuvers => {
             Flight::maneuvers(start()?, limits(p), mode, &maneuvers()?, heights)
@@ -248,5 +268,9 @@ pub fn build(p: &Platform, model: &AltitudeModel) -> Result<Box<dyn Trajectory>,
             Flight::track(&points, tau, limits(p), mode)
         }
     };
-    Ok(Box::new(flight.map_err(geo(owner))?))
+    let mut flight = flight.map_err(geo(owner))?;
+    if let Some(t) = until {
+        flight.extend_to(t, heights).map_err(geo(owner))?;
+    }
+    Ok(Arc::new(flight))
 }

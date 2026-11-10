@@ -18,6 +18,8 @@ Contents:
 10. Proposed tolerances and decisions phase 1 must settle
 11. Scenario quantities and files
 12. Frames, geodesy and altitude
+13. Trajectories and attitude
+14. Light time and per-block polynomial fitting
 
 ---
 
@@ -298,7 +300,7 @@ h(t)   = 2f_c·sinc(2f_c(t − τ_g))·exp(−2π²σ²(t − τ_g)²)
 | Type | Bytes | Fields |
 | --- | --- | --- |
 | `PolyRegisters` | 64 | D0..D3 as `[lo, hi]` u64 pairs |
-| `PathSegment` | 240 | delay, coord and phase registers; block u64; `AmplitudePoly` (4 × f32 + `inv_len`); target, coord units and coord source u32; `EmissionRef` (kind, index) |
+| `PathSegment` | 248 | delay, coord and phase registers; block u64; `AmplitudePoly` (4 × f32 + `inv_len`); target, coord units and coord source u32; `EmissionRef` (kind, index); `first`, `len` u32 (since prompt 9) |
 | `Pulse` | 32 | start and fall_start (Q32.32 target samples, relative to the emission time); amplitude f32; rise and fall table u32; pad |
 | `PulseTrain` | 8 | first pulse, count (sorted by start) |
 | `CwEmission` | 8 | constant complex envelope |
@@ -306,8 +308,9 @@ h(t)   = 2f_c·sinc(2f_c(t − τ_g))·exp(−2π²σ²(t − τ_g)²)
 
 - **Waveform coordinate** `w(k) = F_s·(t_acq(k) − τ(k) − t_ref)`, Q32.32 target samples. `t_acq` comes from the ClockMap, so clock error moves pulse timing. `t_ref` is the origin of the source segment (for a pulse train, its emission time).
 - **Rebasing:** |w| and |pulse offsets| < 2³⁰ samples (`MAX_COORD_SAMPLES`). A long-running source gets a later origin, so `w − offset` never overflows i64.
-- **Coordinate shape (v1):** `validate()` accepts only linear, non-decreasing coordinates (D2 = D3 = 0, D1 ≥ 0), so the endpoint range check bounds every interior value. Endpoint checks alone would miss an interior wrap of a curved polynomial. Phase 3 must add an extremum and monotonicity check before it accepts cubic coordinates.
-- **Kernel:** each worker takes a contiguous chunk, jumps the coordinate and phase polynomials to the chunk start, then steps. Per sample, in this order with separate f32 operations:
+- **Segments (prompt 9):** a `PathSegment` covers the block samples `[first, first + len)` (`len ≥ 1`, `first + len ≤` block length), and its delay, coordinate, phase and amplitude polynomials are in the segment-local index j = k − first over `len` samples (amplitude x = f32(j)·f32(1/len)). A path is one segment per knot-free, budget-meeting interval (§14); segments of one path never overlap. The work-list hash is `iqsim.worklist.v2` and covers `first` and `len`.
+- **Coordinate shape (prompt 9):** cubic coordinates are accepted when they are non-decreasing and wrap-free over the segment (`coordinate_is_monotone`): the exact value `D0 + j·D1 + C(j,2)·D2 + C(j,3)·D3` fits i128 at both ends, and the step `Δ1(j) = D1 + j·D2 + C(j,2)·D3` is ≥ 0 at j = 0, at j = len − 2 and, when D3 > 0, at the two integers around the vertex `j* = ½ − D2/D3`, all in checked i128 (overflow rejects). A wrap-free, monotone value between in-range endpoints never leaves the range, so the endpoint checks bound the interior. (v1 accepted only linear coordinates; endpoint checks alone would miss an interior wrap of a curved polynomial.)
+- **Kernel:** each worker takes a contiguous chunk and, per segment, the part of the chunk inside `[first, first + len)`; it jumps the coordinate and phase polynomials to where the chunk enters the segment (j = max(k0, first) − first), then steps. Per sample, in this order with separate f32 operations:
   1. `a = c0 + x(c1 + x(c2 + x·c3))`, x = f32(k)·inv_len, from scratch
   2. the envelope: CW constant, or `Σ A_i·(G_rise(w − start_i) − G_fall(w − fall_i))`
   3. `sincos(phase)`
@@ -363,7 +366,7 @@ The antenna-port target renders through B_out with its own V_fs (scenario `full_
 
 ### 5.6 Continuous sources and the two-stage resampler (settled, prompt 6a)
 
-`iqsim_waveform::continuous` (stage 1), `iqsim_render::farrow_value` (stage 2), `iqsim_runtime::static_scene` (coordinates and windows), `iqsim_io::iq_input` (SigMF IQ files).
+`iqsim_waveform::continuous` (stage 1), `iqsim_render::farrow_value` (stage 2), `iqsim_runtime::scene` (coordinates and windows; `static_scene` until prompt 9), `iqsim_io::iq_input` (SigMF IQ files).
 
 **Model.** A source is N complex samples x[n] at native rate F_n, normalized so |x| = 1 is full scale (ci16: i/32768; cf32 as stored). Sample n is emitted at `start + n/F_n` on the emitter carrier f_e. The continuous envelope is `x(t) = Σ x[n]·φ(t − n)` (t in native samples), with φ the **source reconstruction response**: the §5.1 family with tap kind `SourceReconstruction` (code 3), zero group delay, default passband 0.8·F_n and stopband F_n (full widths), 80 dB. Its stopband edge ≤ F_n/2 puts every image of the native spectrum at least A dB down. For a target with response H and Δf = f_e − f_c, a path delivers `a·z(w)·e^{jφ(k)}` with
 
@@ -421,6 +424,7 @@ A versioned document written alongside every run. It is never part of consumer-v
 - `scenario`: absolute source path and file SHA-256, the resolved scenario (every default filled in, `iqsim_runtime::ResolvedScenario`) and its canonical SHA-256.
 - `seed`, `run_mode`, `block_ps`, `duration_ps`, `assets` (`AssetRegistry`: kind, logical name, path, length, SHA-256, format, metadata SHA-256). Since prompt 6a, each IQ-file emitter registers `<emitter>.data` (kind `iq_input`, format `sigmf/<datatype>`, metadata = the canonical JSON of the datatype, exact rate, N, start, end policy, normalization and factor, reconstruction response and meta SHA-256) and `<emitter>.meta` (format `sigmf-meta`). Large files are hashed in a streaming pass (`register_digest`) and verified the same way (`verify_digests`), `event_log` (always absent until prompt 16), `outputs` (stream, sink, tap, format, output rate, centre, first index, count, SHA-256 of the sample bytes, path, finalized, ADC clip count) and `truth` (path and SHA-256 of the canonical truth record). The truth record (schema 1) has per stream the render and output rates and counts, the output → render index factor, the decimation delay in render samples, the first sample's acquisition instant (ClockMap) and reported label (timestamp clock), and the effective full scale; and per (stream, emitter) link the range, delay (s and render samples), carrier offset, response gain and power at the target plane.
 - **Since prompt 7 (manifest schema 2, resolver version 2):** `warnings` (deterministic resolution warnings, e.g. the zero-geoid fallback; replay requires them to match), replay also requires the asset list to equal the one the re-resolved scenario produces (no omitted, extra or edited records), the resolved scenario's `world` (geoid model and file identity, pressure offset), and the `geoid` asset when a grid is configured (§12.5).
+- **Since prompt 9 (resolver version 3, truth schema 2; manifest schema unchanged):** the resolved scenario has `platforms` (name, trajectory kind, span, knot count and `trajectory_sha256`, §14.5), and emitters and streams name their `platform` (`position_ecef_m` is the platform's position at truth time 0, or at its trajectory start if later). The built trajectories travel with the resolved scenario but are not serialized; replay re-resolves them from the verified scenario and requires the same fingerprints. The truth record's links are evaluated by light time at the stream's first sample (`range_m` = c·τ, `range_rate_m_s`, `doppler_hz`, `emission_time`, delay, response gain at the Doppler-shifted offset, power) and carry `geometry_fit` (blocks, segments, worst residuals and every split).
 - `backend` (name, threads) and `nondeterministic` (wall-clock start/end, host, render seconds) are excluded from `deterministic_sha256`.
 - **Canonical JSON (decided, prompt 6):** "iqsim canonical JSON v1": no whitespace, object keys sorted by UTF-8 bytes, serde_json string escaping, decimal integers and serde_json's shortest round-trip floats (`float_roundtrip` is enabled so parsing gives the same bits back). It is RFC 8785 except for float formatting outside 10⁻⁶..10²¹; exact quantities are integers, so they never reach that difference.
 - **Run directory:** `consumer/<sink>/<stream>.sigmf-{data,meta}` for consumers; `run/manifest.json` and `run/truth.json` are privileged and never under `consumer/`.
@@ -504,6 +508,7 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 - **Continuous sources (prompt 6a):** the source trait, timelines and the stage-1 kernel in **iqsim-waveform** (`continuous`); window types in **iqsim-worklist**; the Farrow kernel in **iqsim-render**; the SigMF IQ reader in **iqsim-io** (`iq_input`); coordinates, grouping and the reader adapter in **iqsim-runtime**. No dependency edges were added: the runtime adapts the io reader to the waveform trait.
 - **iqsim-geo (prompt 7):** vectors, geodetic ↔ ECEF, pseudo-inertial ECI, quaternions, NED/body/antenna frames, the PGM geoid reader, ISA, Gillham and the altitude chain (§12). It reads a geoid file but hashes nothing; the runtime hashes and registers it. No dependency edges were added (proptest is a dev-dependency).
 - **Trajectories (prompt 8):** the `Trajectory` trait, maneuvers, routes, tracks (the smoothing spline), derived attitude and appends in **iqsim-geo** (`trajectory`, §13); the scenario → trajectory builder in **iqsim-runtime** (`trajectory`). No dependency edges were added.
+- **Light time and fitting (prompt 9):** the light-time solver and the `Lookback` wrapper in **iqsim-geo** (`light_time`, `trajectory::Lookback`); the exact path model, the fitter, refinement and the fit log in **iqsim-runtime** (`geometry`), the work-list builder in **iqsim-runtime** (`scene`, which replaces `static_scene`); segment ranges in **iqsim-worklist**; the segment kernel in **iqsim-render**. No dependency edges were added.
 - **iqsim-receiver:** the virtual-receiver chain and the antenna-port conversion (§5.4, §5.5). **iqsim-io:** SigMF and UTC labels (sha2, serde_json). **iqsim-runtime:** scenario resolution, the offline pipeline, truth record, manifest and replay (sha2, serde, serde_json, hex, libm; a `build.rs` that only runs `rustc -vV`).
 - **iqsim-contracts:** pure data and pure encode/decode, with no sockets, files or simulation logic (serde, serde_json, sha2, hex since prompt 6). It holds:
   - the control envelope, commands, acks and status
@@ -534,6 +539,7 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 | Noise floor check | ±0.2 dB vs kTBF·NF (**tested**, prompt 6: total −0.037 dB, Welch passband −0.036 dB) | phase 2 |
 | Diffraction check | ±0.1 dB vs independent P.526 | phase 8 |
 | Out-of-band in-band level | ±0.1 dB vs selected H_rx/B_out (**tested**, prompt 6) | phase 2 |
+| Doppler and phase | moving CW emitter's phase within the carrier-phase bound of the analytic solution (**tested**, prompt 9: 1.8·10⁻⁷ rad worst over six blocks through closest approach; frequency within 2.2·10⁻⁵ Hz) | phase 3 |
 | Determinism | identical hashes (CPU, GPU models, split/unsplit) | always |
 
 **Decisions phase 1 must settle** (record the outcome here, then bump to contract version 1):
@@ -547,7 +553,7 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 7. **Settled (prompt 2).** R₀ = 50 Ω RMS, S = 40, headroom limit L = 2⁶², null floor V_ref·10⁻² with V_ref defined per link and block, and below-floor absolute bound 10⁻⁵·V_ref (§2).
 8. **Settled (prompt 3).** Philox4x32-10 with the SplitMix64-finalizer key mix (injective within a seed), counter (sample index, sub-index), the `StreamKind` registry, the in-house f32 `ln` and the unit-power Box-Muller noise (§1.5).
 9. Event-time grid for rounding C, and command vs entity-event ordering at equal times (before phase 4–5).
-10. Error-budget sampling and refinement policy, including derivative bounds vs adaptive refinement and maximum depth (before phase 3).
+10. **Settled (prompt 9).** Error-budget sampling and refinement: cubic interpolation on Chebyshev–Lobatto nodes, 15 check points per interval against the exact model, acceptance at a quarter of every budget, conservative halving up to `MAX_REFINE_DEPTH` = 12 with an explicit failure beyond it, and splits first at trajectory knots mapped to receive time (§14.3). Point checks are diagnostics, not a proof between points; the factor 4 is the margin for f⁽⁴⁾ varying across an interval.
 
 Later phases pin these with the implementation: the manifest canonical encoding, the VITA-49 profile (timestamp units, MTU, context cadence) and the strict-sink window defaults.
 
@@ -622,7 +628,7 @@ Scenario files are TOML, read by `iqsim-scenario` into types from `iqsim-units`.
   - fewer than two track points, or times that do not strictly increase.
 
   Geometric feasibility (a waypoint inside the turn circle, an unreachable altitude) is checked when the trajectory is built at resolution.
-- **What `sim run` supports (prompt 6, updated in prompts 7 and 8).** Static platforms; every trajectory is built at resolution, and a moving one is then an explicit error until the light-time geometry engine (prompt 9); MSL heights add the geoid height (0 without a grid), flight levels resolve through the inverse pressure-altitude chain, and AGL heights are still taken as ellipsoidal (no terrain yet); mounts and antennas are ignored (isotropic at the platform origin); emitters must use `behavior = "always_on"` and the built-in `waveform = "cw"` or `"iq_file"` (prompt 6a); only SigMF sinks are written, and a stream's sinks must agree on the format. Anything else is a resolution error, never a silent default.
+- **What `sim run` supports (prompt 6, updated in prompts 7, 8 and 9).** Static and moving platforms of every trajectory kind (since prompt 9): every trajectory is built at resolution, extended straight and level to the run end if its plan ends earlier, and rendered through light time (§14); MSL heights add the geoid height (0 without a grid), flight levels resolve through the inverse pressure-altitude chain, and AGL heights are still taken as ellipsoidal (no terrain yet); mounts and antennas are ignored (isotropic at the platform origin); emitters must use `behavior = "always_on"` and the built-in `waveform = "cw"` or `"iq_file"` (prompt 6a); only SigMF sinks are written, and a stream's sinks must agree on the format. Anything else is a resolution error, never a silent default.
 - **Diagnostics:** `file:line:col: error: message` with 1-based lines and columns counted in characters, then the source line with a caret under the span. Duplicates add a `note:` at the first definition. `sim lint` exits 0 when clean, 1 on errors or an unreadable file, and 2 on usage errors.
 - Clock and LO models (`{ model = "ideal" }`), mounts, sinks and resources are placeholders that later prompts extend. Resource capacity is optional, and a missing capacity is reported as unverified (§8).
 
@@ -806,3 +812,70 @@ All in `iqsim-geo::trajectory`, f64 through `libm`, separate multiplies and adds
   - Appends work after track prefixes too.
   - On error the flight is unchanged.
 - **`extend_to(t)`** appends straight and level until at least t.
+
+## 14. Light time and per-block polynomial fitting (settled, prompt 9)
+
+`iqsim_geo::light_time` (the solver), `iqsim_geo::trajectory::Lookback`, `iqsim_runtime::geometry` (exact model, fit, checks, refinement, log) and `iqsim_runtime::scene` (work lists). Control plane, f64 through `libm`, fixed operation order; the render path still sees only fixed-point polynomials.
+
+### 14.1 Light time
+
+- Every path solves `|r_rx(t) − r_tx(t − τ)| = c·τ` in the pseudo-inertial ECI frame (§12.1), each endpoint rotated at its own instant (`EarthOrientation::at`), velocities including ω × r. Earth rotation during the light time (the Sagnac term) is therefore included: ≈ 155 ps on a 30 km east–west link at the equator.
+- `solve_receive(rx, tx, t)`: fixed-point iteration from τ₀ = |r_rx(t) − r_tx(t)|/c, `τₙ₊₁ = |r_rx(t) − r_tx(t − τₙ)|/c`, with `t − τ` formed as Q64.64 ps (`instant_offset`, τ rounded once to f64 ps then scaled exactly by 2⁶⁴; |τ| ≤ 10⁶ s), so no absolute time meets a float product. **Stopping rule:** stop when `|τₙ₊₁ − τₙ| ≤ max(10⁻¹⁶ s, 4·ulp(τₙ₊₁))`, at most 10 updates (`NoConvergence` beyond); the transmitter is then evaluated once more at `t − τₙ₊₁`, and τ is reported as that distance / c, so τ, the range and the endpoint states agree. The map contracts with factor β ≈ |v_tx|/c (3·10⁻⁵ for LEO), so the remaining error is ≈ β/(1−β) times the last step (< 10⁻²⁰ s); LEO and GEO converge in 3 updates (tests assert ≤ 5). Coincident endpoints are an error.
+- `tau_rate` = dτ/dt = `û·(v_rx − v_tx)/(c − û·v_tx)` (ECI, û from transmitter to receiver). The received carrier's Doppler shift is `−f_e·τ̇`.
+- `solve_emit(rx, tx, t_e)` solves `|r_rx(t_e + τ) − r_tx(t_e)| = c·τ` the same way; it maps a transmitter knot (emission time) to its receive time.
+- The first guess evaluates the moving endpoint at the fixed instant **clamped into its span** (review fix: a transmitter knot before the receiver's start, or a reception after the transmitter's end, made the first guess fail although the solution was valid).
+- **Phase centres:** platform origins until prompt 10 (antenna phase centres and lever arms).
+- **Tested** (`crates/iqsim-geo/tests/light_time.rs`): two Earth-fixed equator points against an independent bisection of `cτ = 2R·sin(|Δλ − ω_E·τ|/2)`, both directions (Sagnac of opposite sign) at 30 km and 3000 km and at 100 days; uniform ECI motion (7.5 km/s) against the closed-form quadratic root and its derivative: worst 5.6·10⁻¹⁸ s (bound 10⁻¹⁵ s), τ̇ within 2.8·10⁻¹³ of a finite difference; `solve_emit` inverts `solve_receive` within 10⁻³ ps for LEO and GEO (measured 0).
+
+### 14.2 Look-back before a trajectory start
+
+Light time evaluates the transmitter before t = 0, which is before a `Flight`'s span start. **Decision (with the user): extrapolate.** Every transmitter trajectory is wrapped in `Lookback` (1 s, `MAX_LOOKBACK`): for t in [start − 1 s, start) the state is the second-order Taylor extrapolation of the start state, `p₀ + (v₀·dt + (a₀·(½dt))·dt)`, `v₀ + a₀·dt`, `a₀`, with attitude and angular rate held, so the join is C2; the start itself is reported as a knot (a jerk step), so no fit crosses it. A trajectory without a start (`Static`) passes through unchanged. Before start − 1 s it is `OutsideSpan`. Receivers are evaluated only at their own acquisition instants and are not wrapped.
+
+### 14.3 Exact model, fit and refinement
+
+For sample k of a block at acquisition instant t (`ClockMap.instant`, the Q64.64 fraction kept), with τ and τ̇ from §14.1:
+
+| Quantity | Exact model | Representation |
+| --- | --- | --- |
+| delay | τ·F_s target samples | f64 |
+| phase | `phase_at(f_off, t′) − carrier_phase(f_e, τ(t′))` | u64, 2⁻⁶⁴ cycle, modular |
+| coordinate | `q64_interval_to_q32(t − t_ref, F) − round(F·τ·2³²)` | i128, Q32.32 in coordinate units |
+| amplitude | `V_ref·g`, `V_ref = √(P·R₀)·λ/(4π·c·τ)` | f64 volts |
+
+t′ = t, except for CW through a response with group delay, where t′ = t − τ_g (below).
+
+- `carrier_phase(f_e, τ) = ⌊f_µHz·d/10¹⁸⌋ mod 2⁶⁴` with d = τ as Q64.64 ps: an exact 64 × 128-bit product in three limbs and long division by 10¹⁸, so `f_e·τ` keeps its fraction for any link (prompt 5's 2⁴⁰-cycle limit is gone; τ's own f64 precision is what remains).
+- **CW fold:** `g = |H(f_inst)|` at the instantaneous offset `f_inst = f_off − f_e·τ̇`, and the response's group delay is applied **exactly**: the whole geometry (phase, τ, amplitude) is evaluated at `t − τ_g`, because a linear-phase response delays an in-band tone's trajectory by τ_g. (Review fix: the first-order fold `−f_inst·τ_g` omitted ½τ_g²·φ̈, measured 0.029 rad for a 31 GHz pass at 7.5 km/s and 550 km with τ_g = 1 ms; the exact form is within 1.0·10⁻⁶ rad there.)
+- **Pulses and continuous sources are filtered at the Doppler-shifted offset** (review fix: they were filtered at the nominal offset, which for a 31 GHz emitter closing at 7.5 km/s is 775 kHz off). Each segment's edge tables or resampling kernel are built at `offset_uhz = f_off + round(D/grid)·grid`, D = the mean of f_inst over the nodes minus f_off, on a grid of half the tolerance `doppler_tolerance_hz` = min(¼·A_budget·√(2π)·σ, ¼·P_budget/(2π·τ_g)): max|H′| = 1/(√(2π)σ) bounds the magnitude change, 2π·δ·τ_g the group-delay phase. With no Doppler the key is exactly f_off. Tables and kernels are cached by key and built when a segment first needs them, before its block renders; a pulse's activity is tested on its nominal-offset tables with one sample of margin. The Doppler compression of the source's own spectrum (ν·τ̇, ≤ 25 Hz for 1 MHz at LEO speeds) is not modelled in the key. `g = 1` for them.
+- The coordinate origin `t_ref` is the pulse train's emission time (F = F_s) or the continuous source's sample-0 time (F = F_n, rebased to the window per §5.6).
+- **Nodes:** an interval of n samples is interpolated through the samples at `u = 0, ¼, ¾, 1` (`j = round(u·(n − 1))`, duplicates dropped, so the degree is ≤ min(3, n − 1)): the degree-3 Chebyshev–Lobatto points, which include the ends, so adjacent segments and blocks meet at exactly evaluated values. Each quantity's variation from the first node is interpolated (Newton divided differences, expanded to the power basis in j, then forward differences `D1 = a1 + a2 + a3`, `D2 = 2a2 + 6a3`, `D3 = 6a3`). Delay D0 = τ₀·F_s; phase D0 = the exact phase at j = 0 (high word); the coordinate's exact Q32.32 start is kept as an i128 beside a D0 = 0 variation polynomial and placed into D0 after rebasing (|w| < 2³⁰ samples, §5.2). Amplitude: an f32 cubic in the kernel's `x = f32(j)·f32(1/n)` through the same nodes (constant when all node values are equal).
+- **Checks:** at 15 points, `u = 0, 1/16, ½ − √(5/32), 3/16, ¼, 5/16, 7/16, ½, 9/16, 11/16, ¾, 13/16, ½ + √(5/32), 15/16, 1`: the ends, the inner nodes, the three extrema of the nodal polynomial `u(u − ¼)(u − ¾)(u − 1)` (where a smooth function's interpolation error peaks; |ω| = 1/64 at ½ and 9/1024 at the outer two) and the odd sixteenths. The fixed-point polynomials are evaluated exactly as the kernel does (jump, floor extraction, f32 Horner), against the exact model:
+  - delay: |Δ| in target samples;
+  - phase: the wrapped difference of the two u64 phases, radians;
+  - coordinate: |Δ| in target samples (native units × F_s/F);
+  - amplitude: |Δa|/a above the null floor; below it |Δa| over 10⁻⁵·V_ref/budget, so acceptance there is the §2 absolute bound (review fix: a deep-stopband value that underflows f32 had counted as a 100 % error);
+  - response (`Residuals::response`): for pulses and continuous sources |f_inst − key|/tolerance; for CW the change of f_inst between adjacent check points over σ/8, so |H(f_inst)| is resolved by the checks (review fix: a sweep through a sharp edge could vanish between checks). Accepted at ≤ 1.
+- **Acceptance:** every residual ≤ budget / `FIT_MARGIN` (4): delay 2.5·10⁻⁴ samples, phase 2.5·10⁻³ rad, coordinate 2.5·10⁻⁴ target samples, amplitude 2.88·10⁻⁴ (¼ of 0.01 dB). Phase is checked at every point (null floors arrive with antenna gains in prompt 10).
+- **Why this is conservative.** On an interval without known discontinuities the interpolation error is ≈ f⁽⁴⁾(ξ)/24·ω(u)·T⁴, and the checks include ω's extrema, so the error between checks exceeds the largest checked residual only through the variation of f⁽⁴⁾ across the interval. The factor 4 covers f⁽⁴⁾ changing by up to 4× within one interval. Point checks remain diagnostics, not a proof between points (plan, "Error budget").
+- **Refinement:** an interval that misses acceptance is halved and both halves are fitted and checked again, depth first, left half first, at most `MAX_REFINE_DEPTH` = 12 halvings (4096 segments per knot-free interval); missing it there is `FitError::Budget` with the interval and residuals, and the block (and the run) fails. Halving an interval cuts the cubic interpolation error by ≈ 16.
+- **Knot splits first:** before fitting, the block is split at every receiver knot (receive time) and every transmitter knot mapped to receive time by `solve_emit`, at the first sample whose instant is at or after it (`index_at_or_after`); a split at a block edge needs none. The transmitter knots searched are those between the emission instants of the block's first and last samples. Jerk is discontinuous at knots, so no fitted interval crosses one. Future effective parameter changes and blockage transitions (prompt 10) will enter the same list.
+- **Delay range:** the fitted delay cubic must stay inside ±(2³¹ − 1) samples over the whole interval, its interior extrema included (review fix: node checks alone missed an interior crossing that wraps in Q32.32), else `FitError::DelayRange`.
+- **Coordinates far from their origin:** the interval `t − t_ref` is taken as whole ps (i128) plus the fraction (review fix: two instants ±100 days apart overflowed one Q64.64 i128).
+- **Measured** (`crates/iqsim-runtime/tests/geometry.rs`, against independent light-time references that solve the closed-form ECI motion directly):
+  - moving CW (uniform ECI motion at 7.5 km/s passing 50 km over the receiver, 2.2 GHz, 2 MS/s, 10 ms blocks; Doppler −12.5 to +26.4 kHz): rendered phase within **1.8·10⁻⁷ rad** of `f_off·t − f_e·τ(t)` at every sample of six blocks through closest approach; frequency over 1 ms windows within 2.2·10⁻⁵ Hz;
+  - LEO pass (circular orbit at 550 km passing overhead, 10 GHz, 1 MS/s, 4 s blocks, a CW and a pulse emitter): one cubic per block misses the budget; 3090 refinement splits over three blocks, most of them on the pulse path, whose 14 kHz Doppler sweep per block must stay within the 8.7 Hz tolerance of a 400/500 kHz response; at ≥ 98 points per segment the worst errors are delay 5.2·10⁻⁹ samples, phase 3.3·10⁻⁴ rad, coordinate 1.0·10⁻⁹ samples, amplitude 7.3·10⁻⁸;
+  - review regressions: a CW sweep at ≈ 1 kHz/s through a 100/200 Hz response edge refines until every sample's amplitude is within 0.23 of its budget; a pulse from a 31 GHz emitter closing at 7.5 km/s, nominally 775.5 kHz off, arrives at the channel centre at its Friis level within 2·10⁻⁷ dB; a moving receiver whose plan ends inside the final block, with a 100 µs clock offset, renders;
+  - an aircraft whose turn knots fall inside blocks: each transmitter-knot split is the first sample whose emission time is at or after the knot; output is identical across 1, 3 and 8 threads and chunk lengths 777 and 1.
+
+### 14.4 Work lists, culling, headroom and the fit log
+
+- Each fitted interval becomes one `PathSegment` (§5.2). Culling is per segment (lossless at the default threshold, as in §2: every component of a culled segment rounds to 0). The headroom proof adds, per path, the **largest** bound over its kept segments, because segments of one path never overlap in time.
+- Pulse activity uses the coordinate over the whole block (the first segment's start to the last segment's end; the coordinate is monotone). A continuous path's window covers all of its segments' coordinates, and each segment's start is rebased to the window origin.
+- Pulses get one `PulseTrain` per segment, with the tables at that segment's offset, and continuous segments are grouped into windows by their segment's kernel.
+- **`stop` sources:** exhaustion is checked on the **exact** retarded coordinate of the last kept sample (review fix: the fitted one can fall short by the fit residual).
+- **Fit log:** `SceneBuilder::build_block_logged` returns every path's segments (with residuals) and splits (`rx_knot`, `tx_knot`, `refine` with the halved interval's residuals). The offline runner aggregates them per (stream, emitter) into the truth record's `geometry_fit`: blocks, segments, worst residuals, and every split with its block, sample and reason. The log is deterministic and covered by the truth hash.
+
+### 14.5 Resolution
+
+- Every platform's trajectory is built at resolution and, if its plan ends earlier, extended straight and level (`trajectory::build_until`, `Flight::extend_to`) to the last instant the run can evaluate: duration + one block (the final block is fitted whole) + the largest receiver clock offset + 1 ms (review fix: extending to the nominal duration left the final block's tail outside the span).
+- The resolved scenario's `platforms` record kind, span, knot count and `trajectory_sha256` = SHA-256(`"iqsim.trajectory-fingerprint.v1\0"` ‖ per instant: ps (i64 LE) ‖ position, velocity, acceleration, q_ecef_body (w, x, y, z), angular rate as f64 bits LE) over max(span start, −1 s), every knot before that last instant, and the last instant (or the span end).

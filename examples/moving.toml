@@ -1,0 +1,92 @@
+# A moving emitter (prompt 9): an aircraft transmitting CW at 1090 MHz flies past a
+# ground site and starts a turn. Light time is solved in ECI at every evaluated
+# sample, so the IQ carries the Doppler shift and its change through the turn.
+# Lint it with: sim lint examples/moving.toml
+# Run it with:  sim run --offline examples/moving.toml --out /tmp/moving
+# Replay with:  sim replay /tmp/moving/run/manifest.json
+
+schema_version = 1
+epoch = 2026-01-01T00:00:00Z
+seed = 7
+run_mode = "offline"
+
+[metadata]
+name = "moving"
+description = "An aircraft CW emitter turning near a ground receiver."
+
+[render]
+duration = "20 ms"
+block = "1 ms"
+
+[[platforms]]
+name = "site"
+position = { lat = 51.0, lon = -1.0, alt = "60 m MSL" }
+mounts = [{ name = "mast", antenna = "isotropic" }]
+
+# 20 km west of the site at FL100, heading east at 250 kt, then a turn to the right
+# that starts 5 ms into the run.
+[[platforms]]
+name = "aircraft"
+position = { lat = 51.0, lon = -1.285, alt = "FL100" }
+
+[platforms.trajectory]
+kind = "maneuvers"
+heading = "80 deg"
+speed = "250 kt"
+
+[[platforms.trajectory.maneuvers]]
+kind = "straight"
+duration = "5 ms"
+
+[[platforms.trajectory.maneuvers]]
+kind = "turn"
+bank = "25 deg"
+direction = "right"
+by = "30 deg"
+
+[[emitters]]
+name = "cw"
+platform = "aircraft"
+frequency = "1090.2 MHz"
+power = "40 dBm"
+behavior = "always_on"
+waveform = "cw"
+
+[[receivers]]
+name = "rx"
+platform = "site"
+mount = "mast"
+
+[[receivers.channels]]
+name = "ch0"
+center_frequency = "1090 MHz"
+sample_rate = "4 MS/s"
+bandwidth = "3 MHz"
+front_end = { gain = "30 dB", noise_figure = "5 dB" }
+adc = { full_scale = "-30 dBm", bits = 16 }
+sinks = ["recording"]
+
+[[antenna_ports]]
+name = "port"
+platform = "site"
+mount = "mast"
+center_frequency = "1090 MHz"
+sample_rate = "4 MS/s"
+bandwidth = "3 MHz"
+full_scale = "-40 dBm"
+sinks = ["port_recording"]
+
+[[sinks]]
+name = "recording"
+kind = "sigmf"
+resources = ["scratch_disk"]
+
+[[sinks]]
+name = "port_recording"
+kind = "sigmf"
+resources = ["scratch_disk"]
+
+[[resources]]
+name = "scratch_disk"
+kind = "disk"
+capacity = "400 MB/s"

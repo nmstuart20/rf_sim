@@ -5,20 +5,21 @@
 //!
 //! # Per-sample kernel (contracts §5.2)
 //!
-//! For each path and local sample k, in this order, with every f32 operation separate:
+//! For each path segment and each block sample k in `[first, first + len)`, with the
+//! segment-local index j = k − first, in this order, with every f32 operation separate:
 //!
-//! 1. `a = amplitude.eval(k)` (volts, Horner from scratch).
+//! 1. `a = amplitude.eval(j)` (volts, Horner from scratch).
 //! 2. Envelope `(er, ei)`: the CW envelope, or for a pulse train
 //!    `Σ_i A_i·(G_rise(w − start_i) − G_fall(w − fall_start_i))` over the train's pulses
-//!    in order, with w the waveform coordinate at k. Each G is a linear interpolation
+//!    in order, with w the waveform coordinate at j. Each G is a linear interpolation
 //!    of its edge table ([`edge_value`]). For a continuous emission, the 6-tap Farrow
 //!    interpolation of its stage-1 window at w ([`farrow_value`]).
-//! 3. `(s, c) = sincos(phase(k))`.
+//! 3. `(s, c) = sincos(phase(j))`.
 //! 4. `pr = er·c − ei·s`, `pi = er·s + ei·c`.
 //! 5. `m = a·lsb_per_volt`, `I = pr·m`, `Q = pi·m`.
 //! 6. Each component rounds ties-to-even to i64 and is added with a checked add.
 //!
-//! The polynomials jump to the chunk start and then step, and jump and step agree bit
+//! The polynomials jump to where the chunk enters the segment and then step, and jump and step agree bit
 //! for bit. Every other quantity is computed from k or w alone. Every per-sample
 //! contribution is therefore independent of chunking, and integer addition makes the sum
 //! independent of path order and thread count.
@@ -257,8 +258,18 @@ fn render_chunk(
     let k1 = k0 + n;
     let tables = &*work.tables;
     for path in &work.paths {
-        let coord = path.coord.to_poly::<Delay>(work.len)?;
-        let phase = path.phase.to_poly::<Phase>(work.len)?;
+        // The part of the chunk this segment covers, [s0, s1) in block samples. The
+        // segment's polynomials are in j = k − first.
+        let first = u64::from(path.first);
+        let seg_len = u64::from(path.len);
+        let s0 = k0.max(first);
+        let s1 = k1.min(first + seg_len);
+        if s0 >= s1 {
+            continue;
+        }
+        let (j0, j1) = (s0 - first, s1 - first);
+        let coord = path.coord.to_poly::<Delay>(seg_len)?;
+        let phase = path.phase.to_poly::<Phase>(seg_len)?;
         let mut pc = PathChunk {
             path,
             pulses: Vec::new(),
@@ -272,10 +283,10 @@ fn render_chunk(
             pc.window = work.continuous[path.emission.index as usize].window;
         } else {
             debug_assert_eq!(path.emission.kind, EMISSION_PULSE_TRAIN);
-            // The coordinate is non-decreasing over a block (builder contract), so the
-            // chunk spans [w(k0), w(k1 − 1)].
-            let w_lo = coord.eval(k0)?.to_bits();
-            let w_hi = coord.eval(k1 - 1)?.to_bits();
+            // The coordinate is non-decreasing over a segment (checked by `validate`),
+            // so the chunk's part spans [w(j0), w(j1 − 1)].
+            let w_lo = coord.eval(j0)?.to_bits();
+            let w_hi = coord.eval(j1 - 1)?.to_bits();
             let train = work.trains[path.emission.index as usize];
             let first = train.first_pulse as usize;
             for p in &work.pulses[first..first + train.pulse_count as usize] {
@@ -288,11 +299,11 @@ fn render_chunk(
                 continue;
             }
         }
-        let mut coord_c = coord.cursor(k0)?;
-        let mut phase_c = phase.cursor(k0)?;
-        for i in 0..n as usize {
-            let k = k0 + i as u64;
-            let a = pc.path.amplitude.eval(k);
+        let mut coord_c = coord.cursor(j0)?;
+        let mut phase_c = phase.cursor(j0)?;
+        for j in j0..j1 {
+            let k = first + j;
+            let a = pc.path.amplitude.eval(j);
             let env = if pc.kind == EMISSION_CW {
                 pc.cw
             } else if pc.kind == EMISSION_CONTINUOUS {
@@ -316,6 +327,7 @@ fn render_chunk(
             let m = a * lsb_per_volt;
             let vi = f32_to_i64_ties_even(pr * m).map_err(|_| RenderError::Contribution { k })?;
             let vq = f32_to_i64_ties_even(pi * m).map_err(|_| RenderError::Contribution { k })?;
+            let i = (k - k0) as usize;
             let slot = &mut acc[2 * i..2 * i + 2];
             slot[0] = slot[0].checked_add(vi).ok_or(RenderError::Overflow { k })?;
             slot[1] = slot[1].checked_add(vq).ok_or(RenderError::Overflow { k })?;
@@ -392,6 +404,116 @@ impl Backend for CpuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iqsim_core::wide::U128;
+    use iqsim_core::{DelayPoly, PhasePoly};
+    use iqsim_worklist::{
+        AmplitudePoly, COORD_TARGET_SAMPLES, CwEmission, EmissionRef, PolyRegisters, TargetDesc,
+    };
+    use std::sync::Arc;
+
+    /// Registers of the same polynomial with its origin moved to index `s`:
+    /// `(p(s), Δ1(s), Δ2(s), D3)`, the cursor state at s (contracts §1.3).
+    fn shifted(r: &PolyRegisters, s: u64) -> PolyRegisters {
+        let w = &r.words;
+        let d = [0, 1, 2, 3].map(|j| U128::new(w[2 * j + 1], w[2 * j]));
+        let c2 = s * s.saturating_sub(1) / 2;
+        let p = d[0]
+            .wrapping_add(d[1].wrapping_mul_u64(s))
+            .wrapping_add(d[2].wrapping_mul_u64(c2))
+            .wrapping_add(d[3].wrapping_mul_u64(if s >= 2 { c2 * (s - 2) / 3 } else { 0 }));
+        let d1 = d[1]
+            .wrapping_add(d[2].wrapping_mul_u64(s))
+            .wrapping_add(d[3].wrapping_mul_u64(c2));
+        let d2 = d[2].wrapping_add(d[3].wrapping_mul_u64(s));
+        let mut words = [0; 8];
+        for (j, x) in [p, d1, d2, d[3]].iter().enumerate() {
+            words[2 * j] = x.lo;
+            words[2 * j + 1] = x.hi;
+        }
+        PolyRegisters { words }
+    }
+
+    #[test]
+    fn segments_render_their_range_and_a_split_path_equals_the_whole() {
+        let len = 1000;
+        let phase = PhasePoly::from_f64_differences([0.1, 0.0123, 3e-6, -2e-9], len).unwrap();
+        let coord = DelayPoly::from_f64_differences([0.0, 1.0, 0.0, 0.0], len).unwrap();
+        let whole = PathSegment {
+            delay: PolyRegisters::from_poly(&coord),
+            coord: PolyRegisters::from_poly(&coord),
+            phase: PolyRegisters::from_poly(&phase),
+            block: 0,
+            amplitude: AmplitudePoly::constant(1e-3, len),
+            target: 0,
+            coord_units: COORD_TARGET_SAMPLES,
+            coord_source: 0,
+            emission: EmissionRef {
+                kind: EMISSION_CW,
+                index: 0,
+            },
+            first: 0,
+            len: len as u32,
+        };
+        let list = |paths: Vec<PathSegment>| BlockWorkList {
+            target: TargetDesc {
+                response: [0; 32],
+                tap_kind: 2,
+                lsb_per_volt: 1e12,
+            },
+            block: 0,
+            first_sample: 0,
+            len,
+            paths,
+            cw: vec![CwEmission {
+                envelope: [1.0, 0.0],
+            }],
+            trains: vec![],
+            pulses: vec![],
+            continuous: vec![],
+            tables: Arc::new(EdgeTableArena::default()),
+            windows: Arc::new(SourceWindowArena::default()),
+        };
+        let render = |w: &BlockWorkList, b: CpuBackend| {
+            let mut acc = vec![0_i64; 2 * len as usize];
+            b.render(w, &mut acc).unwrap();
+            acc
+        };
+        let reference = render(&list(vec![whole]), CpuBackend::new(1));
+        let cuts = [0_u64, 37, 600, len];
+        let parts: Vec<PathSegment> = cuts
+            .windows(2)
+            .map(|c| {
+                let n = c[1] - c[0];
+                PathSegment {
+                    delay: shifted(&whole.delay, c[0]),
+                    coord: shifted(&whole.coord, c[0]),
+                    phase: shifted(&whole.phase, c[0]),
+                    amplitude: AmplitudePoly::constant(1e-3, n),
+                    first: c[0] as u32,
+                    len: n as u32,
+                    ..whole
+                }
+            })
+            .collect();
+        let split = list(parts.clone());
+        for b in [
+            CpuBackend::new(1),
+            CpuBackend::new(3),
+            CpuBackend::new(2).with_chunk_len(1),
+            CpuBackend::new(4).with_chunk_len(77),
+        ] {
+            assert_eq!(render(&split, b), reference);
+        }
+        // One segment alone writes only its own range.
+        let mid = render(&list(vec![parts[1]]), CpuBackend::new(2).with_chunk_len(50));
+        for k in 0..len as usize {
+            let inside = (37..600).contains(&k);
+            assert_eq!(mid[2 * k] != 0 || mid[2 * k + 1] != 0, inside, "k = {k}");
+            if inside {
+                assert_eq!(mid[2 * k..2 * k + 2], reference[2 * k..2 * k + 2]);
+            }
+        }
+    }
 
     #[test]
     fn edge_value_regions_and_interpolation() {
