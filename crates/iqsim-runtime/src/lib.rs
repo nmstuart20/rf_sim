@@ -11,6 +11,7 @@
 pub mod offline;
 pub mod plan;
 pub mod static_scene;
+pub mod trajectory;
 
 pub use offline::{
     LoadedScenario, ReplayReport, RunError, RunOptions, build_identity, load_scenario, replay,

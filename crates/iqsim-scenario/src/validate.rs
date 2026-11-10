@@ -19,6 +19,12 @@
 //!   0 < bandwidth < stopband (≤ the stated sample rate) and 20 to 200 dB. Checks that
 //!   need the recording itself happen when the scenario is resolved.
 //!
+//! - A platform trajectory has the fields its kind needs and no others, each maneuver
+//!   has one rate and one end condition, limits are positive, and track points are in
+//!   strictly increasing time order (contracts §11.4, §13). Plans that need geometry
+//!   (a waypoint inside the turn circle, an unreachable altitude) are checked when the
+//!   scenario is resolved.
+//!
 //! Library references (antennas, waveforms, behaviors) are not resolved yet.
 
 use std::collections::BTreeMap;
@@ -33,8 +39,8 @@ use crate::diagnostic::Diagnostic;
 const MAX_PRESSURE_OFFSET_PA: f64 = 20_000.0;
 use crate::ident::Ident;
 use crate::model::{
-    ClockModel, ClockModelSpec, LoModel, LoModelSpec, ResponseDetail, SCENARIO_SCHEMA_VERSION,
-    Scenario,
+    ClockModel, ClockModelSpec, LoModel, LoModelSpec, ManeuverKind, ManeuverSpec, Platform,
+    ResponseDetail, SCENARIO_SCHEMA_VERSION, Scenario, Trajectory, TrajectoryKind,
 };
 
 /// Every problem found, in source order.
@@ -303,6 +309,426 @@ impl Validator {
         }
     }
 
+    fn trajectory(&mut self, p: &Platform) {
+        let user = format!("platform \"{}\"", p.name.as_str());
+        let t: &Trajectory = &p.trajectory;
+        let kind = t.kind;
+        let kind_name = match kind {
+            TrajectoryKind::Static => "static",
+            TrajectoryKind::Maneuvers => "maneuvers",
+            TrajectoryKind::Route => "route",
+            TrajectoryKind::Track => "track",
+            TrajectoryKind::Ground => "ground",
+        };
+        let name_span = p.name.span();
+        let track = kind == TrajectoryKind::Track;
+        match (&p.position, track) {
+            (None, false) => self.error(name_span.clone(), format!("{user} needs a position")),
+            (Some(_), true) => self.error(
+                name_span.clone(),
+                format!("{user}: a track trajectory starts at its first point; remove `position`"),
+            ),
+            _ => {}
+        }
+        let airborne = matches!(
+            kind,
+            TrajectoryKind::Maneuvers | TrajectoryKind::Route | TrajectoryKind::Track
+        );
+        let moving = kind != TrajectoryKind::Static;
+        let flies = matches!(
+            kind,
+            TrajectoryKind::Maneuvers | TrajectoryKind::Route | TrajectoryKind::Ground
+        );
+        let not_for = |v: &mut Self, span: Option<Range<usize>>, field: &str, ok: bool| {
+            if let Some(span) = span
+                && !ok
+            {
+                v.error(
+                    span,
+                    format!("{user}: `{field}` does not apply to a {kind_name} trajectory"),
+                );
+            }
+        };
+        not_for(self, t.start.as_ref().map(Spanned::span), "start", flies);
+        not_for(
+            self,
+            t.heading.as_ref().map(Spanned::span),
+            "heading",
+            flies,
+        );
+        not_for(self, t.speed.as_ref().map(Spanned::span), "speed", flies);
+        not_for(
+            self,
+            t.attitude.as_ref().map(Spanned::span),
+            "attitude",
+            !moving,
+        );
+        not_for(
+            self,
+            t.angle_of_attack.as_ref().map(Spanned::span),
+            "angle_of_attack",
+            airborne,
+        );
+        not_for(self, t.wind.as_ref().map(Spanned::span), "wind", airborne);
+        not_for(
+            self,
+            t.smoothing.as_ref().map(Spanned::span),
+            "smoothing",
+            track,
+        );
+        not_for(
+            self,
+            t.maneuvers.first().map(Spanned::span),
+            "maneuvers",
+            matches!(kind, TrajectoryKind::Maneuvers | TrajectoryKind::Ground),
+        );
+        not_for(
+            self,
+            t.waypoints.first().map(Spanned::span),
+            "waypoints",
+            matches!(kind, TrajectoryKind::Route | TrajectoryKind::Ground),
+        );
+        not_for(self, t.points.first().map(Spanned::span), "points", track);
+        let limits = &t.limits;
+        let limit_spans = [
+            limits.bank.as_ref().map(Spanned::span),
+            limits.roll_rate.as_ref().map(Spanned::span),
+            limits.accel.as_ref().map(Spanned::span),
+            limits.jerk.as_ref().map(Spanned::span),
+            limits.vertical_accel.as_ref().map(Spanned::span),
+            limits.vertical_jerk.as_ref().map(Spanned::span),
+            limits.climb_rate.as_ref().map(Spanned::span),
+        ];
+        if !moving {
+            for span in limit_spans.iter().flatten() {
+                self.error(
+                    span.clone(),
+                    format!("{user}: a static trajectory has no limits"),
+                );
+            }
+        }
+
+        let need = |v: &mut Self, present: bool, field: &str| {
+            if !present {
+                v.error(
+                    name_span.clone(),
+                    format!("{user}: a {kind_name} trajectory needs `{field}`"),
+                );
+            }
+        };
+        match kind {
+            TrajectoryKind::Static | TrajectoryKind::Track => {}
+            TrajectoryKind::Maneuvers => {
+                need(self, t.heading.is_some(), "heading");
+                need(self, t.speed.is_some(), "speed");
+                need(self, !t.maneuvers.is_empty(), "maneuvers");
+            }
+            TrajectoryKind::Route => {
+                need(self, t.speed.is_some(), "speed");
+                need(self, !t.waypoints.is_empty(), "waypoints");
+            }
+            TrajectoryKind::Ground => {
+                need(
+                    self,
+                    t.heading.is_some() || !t.waypoints.is_empty(),
+                    "heading",
+                );
+                need(self, t.speed.is_some(), "speed");
+                if t.maneuvers.is_empty() == t.waypoints.is_empty() {
+                    self.error(
+                        name_span.clone(),
+                        format!(
+                            "{user}: a ground trajectory needs either `maneuvers` or `waypoints`"
+                        ),
+                    );
+                }
+                if let Some(pos) = &p.position
+                    && pos.altitude().reference() != iqsim_units::AltitudeRef::Agl
+                {
+                    self.error(
+                        name_span.clone(),
+                        format!("{user}: a ground platform's altitude must be AGL (its height above the ground)"),
+                    );
+                }
+                for w in &t.waypoints {
+                    if w.get_ref().alt.get_ref().reference() != iqsim_units::AltitudeRef::Agl {
+                        self.error(
+                            w.get_ref().alt.span(),
+                            format!("{user}: ground waypoint altitudes must be AGL"),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(s) = &t.speed
+            && s.get_ref().meters_per_second() < 1.0
+        {
+            self.error(
+                s.span(),
+                format!("{user}: the speed must be at least 1 m/s"),
+            );
+        }
+        if let Some(a) = &t.angle_of_attack
+            && a.get_ref().degrees().abs() >= 45.0
+        {
+            self.error(
+                a.span(),
+                format!("{user}: the angle of attack must be within ±45°"),
+            );
+        }
+        if let Some(w) = &t.wind
+            && w.get_ref().speed.meters_per_second() < 0.0
+        {
+            self.error(
+                w.span(),
+                format!("{user}: the wind speed cannot be negative"),
+            );
+        }
+        if let Some(s) = &t.smoothing
+            && s.get_ref().get().as_ps() < 0
+        {
+            self.error(
+                s.span(),
+                format!("{user}: the smoothing time constant cannot be negative"),
+            );
+        }
+        let positive = |v: &mut Self, x: Option<(f64, Range<usize>)>, what: &str| {
+            if let Some((x, span)) = x
+                && (x.is_nan() || x <= 0.0)
+            {
+                v.error(span, format!("{user}: {what} must be positive"));
+            }
+        };
+        if let Some(b) = &limits.bank {
+            let d = b.get_ref().degrees();
+            if !(d > 0.0 && d < 80.0) {
+                self.error(
+                    b.span(),
+                    format!("{user}: limits.bank must be between 0° and 80°"),
+                );
+            }
+        }
+        positive(
+            self,
+            limits
+                .roll_rate
+                .as_ref()
+                .map(|x| (x.get_ref().degrees_per_second(), x.span())),
+            "limits.roll_rate",
+        );
+        positive(
+            self,
+            limits
+                .accel
+                .as_ref()
+                .map(|x| (x.get_ref().meters_per_second_squared(), x.span())),
+            "limits.accel",
+        );
+        positive(
+            self,
+            limits
+                .jerk
+                .as_ref()
+                .map(|x| (x.get_ref().meters_per_second_cubed(), x.span())),
+            "limits.jerk",
+        );
+        positive(
+            self,
+            limits
+                .vertical_accel
+                .as_ref()
+                .map(|x| (x.get_ref().meters_per_second_squared(), x.span())),
+            "limits.vertical_accel",
+        );
+        positive(
+            self,
+            limits
+                .vertical_jerk
+                .as_ref()
+                .map(|x| (x.get_ref().meters_per_second_cubed(), x.span())),
+            "limits.vertical_jerk",
+        );
+        positive(
+            self,
+            limits
+                .climb_rate
+                .as_ref()
+                .map(|x| (x.get_ref().meters_per_second(), x.span())),
+            "limits.climb_rate",
+        );
+
+        for (i, m) in t.maneuvers.iter().enumerate() {
+            let owner = format!("{user}, maneuver {}", i + 1);
+            self.maneuver(m, &owner, kind == TrajectoryKind::Ground);
+        }
+        for w in &t.waypoints {
+            if let Some(s) = &w.get_ref().speed
+                && s.get_ref().meters_per_second() < 1.0
+            {
+                self.error(
+                    s.span(),
+                    format!("{user}: a waypoint speed must be at least 1 m/s"),
+                );
+            }
+        }
+        if track && t.points.len() < 2 {
+            self.error(
+                name_span,
+                format!("{user}: a track needs at least two points"),
+            );
+        }
+        for w in t.points.windows(2) {
+            let (a, b) = (&w[0].get_ref().time, &w[1].get_ref().time);
+            if b.get_ref().get() <= a.get_ref().get() {
+                self.error(b.span(), format!("{user}: track point times must increase"));
+            }
+        }
+    }
+
+    fn maneuver(&mut self, m: &Spanned<ManeuverSpec>, owner: &str, ground: bool) {
+        let span = m.span();
+        let m = m.get_ref();
+        let fields: [(&str, Option<Range<usize>>); 9] = [
+            ("duration", m.duration.as_ref().map(Spanned::span)),
+            ("rate", m.rate.as_ref().map(Spanned::span)),
+            ("bank", m.bank.as_ref().map(Spanned::span)),
+            ("heading", m.heading.as_ref().map(Spanned::span)),
+            ("by", m.by.as_ref().map(Spanned::span)),
+            ("vertical_rate", m.vertical_rate.as_ref().map(Spanned::span)),
+            ("angle", m.angle.as_ref().map(Spanned::span)),
+            ("altitude", m.altitude.as_ref().map(Spanned::span)),
+            ("speed", m.speed.as_ref().map(Spanned::span)),
+        ];
+        let (name, allowed): (&str, &[&str]) = match m.kind {
+            ManeuverKind::Straight => ("straight", &["duration"]),
+            ManeuverKind::Turn => ("turn", &["duration", "rate", "bank", "heading", "by"]),
+            ManeuverKind::Climb => ("climb", &["duration", "vertical_rate", "angle", "altitude"]),
+            ManeuverKind::Speed => ("speed", &["speed"]),
+        };
+        for (field, s) in &fields {
+            if let Some(s) = s
+                && !allowed.contains(field)
+            {
+                self.error(
+                    s.clone(),
+                    format!("{owner}: `{field}` does not apply to a {name} maneuver"),
+                );
+            }
+        }
+        if m.direction.is_some() && m.kind != ManeuverKind::Turn {
+            self.error(
+                span.clone(),
+                format!("{owner}: `direction` only applies to a turn"),
+            );
+        }
+        let count = |names: &[&str]| {
+            fields
+                .iter()
+                .filter(|(f, s)| s.is_some() && names.contains(f))
+                .count()
+        };
+        let exactly_one = |v: &mut Self, names: &[&str]| {
+            if count(names) != 1 {
+                v.error(
+                    span.clone(),
+                    format!(
+                        "{owner}: a {name} maneuver needs exactly one of {}",
+                        names
+                            .iter()
+                            .map(|n| format!("`{n}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+        };
+        let positive_duration = |v: &mut Self| {
+            if let Some(d) = &m.duration
+                && d.get_ref().get().as_ps() <= 0
+            {
+                v.error(d.span(), format!("{owner}: the duration must be positive"));
+            }
+        };
+        match m.kind {
+            ManeuverKind::Straight => {
+                exactly_one(self, &["duration"]);
+                positive_duration(self);
+            }
+            ManeuverKind::Turn => {
+                exactly_one(self, &["rate", "bank"]);
+                exactly_one(self, &["duration", "heading", "by"]);
+                positive_duration(self);
+                if (m.duration.is_some() || m.by.is_some()) && m.direction.is_none() {
+                    self.error(
+                        span.clone(),
+                        format!("{owner}: a turn by duration or by angle needs a `direction`"),
+                    );
+                }
+                if let Some(r) = &m.rate
+                    && r.get_ref().degrees_per_second() <= 0.0
+                {
+                    self.error(r.span(), format!("{owner}: the turn rate must be positive"));
+                }
+                if let Some(b) = &m.bank {
+                    let d = b.get_ref().degrees();
+                    if !(d > 0.0 && d < 80.0) {
+                        self.error(
+                            b.span(),
+                            format!("{owner}: the bank must be between 0° and 80°"),
+                        );
+                    }
+                }
+                if let Some(b) = &m.by
+                    && b.get_ref().degrees() <= 0.0
+                {
+                    self.error(
+                        b.span(),
+                        format!("{owner}: `by` must be positive (use `direction`)"),
+                    );
+                }
+            }
+            ManeuverKind::Climb => {
+                if ground {
+                    self.error(
+                        span.clone(),
+                        format!("{owner}: a ground platform cannot climb"),
+                    );
+                }
+                exactly_one(self, &["vertical_rate", "angle"]);
+                exactly_one(self, &["altitude", "duration"]);
+                positive_duration(self);
+                if let Some(r) = &m.vertical_rate
+                    && r.get_ref().meters_per_second() == 0.0
+                {
+                    self.error(
+                        r.span(),
+                        format!("{owner}: the vertical rate cannot be zero"),
+                    );
+                }
+                if let Some(a) = &m.angle {
+                    let d = a.get_ref().degrees().abs();
+                    if !(d > 0.0 && d < 90.0) {
+                        self.error(
+                            a.span(),
+                            format!("{owner}: the climb angle must be within ±90° and not zero"),
+                        );
+                    }
+                }
+            }
+            ManeuverKind::Speed => {
+                exactly_one(self, &["speed"]);
+                if let Some(s) = &m.speed
+                    && s.get_ref().meters_per_second() < 1.0
+                {
+                    self.error(
+                        s.span(),
+                        format!("{owner}: the speed must be at least 1 m/s"),
+                    );
+                }
+            }
+        }
+    }
+
     fn run(&mut self, s: &Scenario) {
         if *s.schema_version.get_ref() != SCENARIO_SCHEMA_VERSION {
             self.error(
@@ -366,6 +792,10 @@ impl Validator {
         }
         for r in &s.resources {
             names.declare(self, &r.name, "resource", "");
+        }
+
+        for p in &s.platforms {
+            self.trajectory(p);
         }
 
         let mut mounts: BTreeMap<&str, Names<'_>> = BTreeMap::new();

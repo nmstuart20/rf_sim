@@ -16,6 +16,10 @@
 //! - [`atmosphere`], [`gillham`] and [`altitude`]: ISA pressure altitude, Gillham
 //!   (Mode C) encoding and the ellipsoid → MSL → pressure-altitude → code chain.
 //!
+//! Since prompt 8 (contracts §13): [`trajectory`], the [`Trajectory`] trait with static
+//! platforms, maneuver primitives, waypoint routes, track replay, ground-clamped
+//! motion, derived attitude and runtime appends.
+//!
 //! All arithmetic is f64 with transcendentals from `libm`, so results are the same
 //! bits on every machine.
 //!
@@ -32,6 +36,7 @@ pub mod geoid;
 pub mod gillham;
 pub mod ned;
 pub mod quat;
+pub mod trajectory;
 pub mod vec;
 
 use std::fmt;
@@ -45,6 +50,7 @@ pub use geoid::{Geoid, GeoidGrid, GeoidGridMetadata};
 pub use gillham::GillhamCode;
 pub use ned::LocalNed;
 pub use quat::Quat;
+pub use trajectory::{Flight, Span, State, Static, Trajectory};
 pub use vec::{Mat3, Vec3};
 
 /// A geometry, geoid or altitude-chain failure.
@@ -82,6 +88,17 @@ pub enum GeoError {
     },
     /// A pressure altitude has no Gillham code.
     Gillham(gillham::GillhamError),
+    /// A trajectory was evaluated outside its span.
+    OutsideSpan {
+        /// The instant asked for (floor), ps.
+        t_ps: i64,
+        /// Span start, ps.
+        start_ps: i64,
+        /// Span end, ps.
+        end_ps: i64,
+    },
+    /// A trajectory could not be built or evaluated (motion plan, attitude).
+    Trajectory(String),
 }
 
 impl fmt::Display for GeoError {
@@ -107,6 +124,15 @@ impl fmt::Display for GeoError {
                 write!(f, "{what} {value} is outside the modelled ISA range")
             }
             Self::Gillham(e) => write!(f, "Mode C: {e}"),
+            Self::OutsideSpan {
+                t_ps,
+                start_ps,
+                end_ps,
+            } => write!(
+                f,
+                "t = {t_ps} ps is outside the trajectory span [{start_ps}, {end_ps}] ps"
+            ),
+            Self::Trajectory(m) => write!(f, "trajectory: {m}"),
         }
     }
 }

@@ -1,0 +1,127 @@
+# Trajectory kinds (prompt 8): static, maneuvers, route, track and ground.
+# Lint it with: sim lint examples/trajectories.toml
+# `sim run` does not render moving platforms yet (light-time geometry is prompt 9);
+# it builds these trajectories and then stops with an explicit error.
+
+schema_version = 1
+epoch = 2026-01-01T00:00:00Z
+seed = 1
+run_mode = "offline"
+
+[metadata]
+name = "trajectories"
+description = "One platform of each trajectory kind around one ground site."
+
+[render]
+duration = "10 ms"
+
+# A static site with a fixed attitude.
+[[platforms]]
+name = "site"
+position = { lat = 51.0, lon = -1.0, alt = "60 m MSL" }
+trajectory = { kind = "static", attitude = { heading = "45 deg" } }
+
+# Maneuver primitives from an initial heading and speed.
+[[platforms]]
+name = "ac1"
+position = { lat = 51.2, lon = -1.4, alt = "FL100" }
+
+[platforms.trajectory]
+kind = "maneuvers"
+heading = "90 deg"
+speed = "250 kt"
+angle_of_attack = "2 deg"
+wind = { speed = "20 kt", from = "270 deg" }
+limits = { roll_rate = "8 deg/s" }
+
+[[platforms.trajectory.maneuvers]]
+kind = "straight"
+duration = "30 s"
+
+[[platforms.trajectory.maneuvers]]
+kind = "turn"
+rate = "3 deg/s"
+heading = "180 deg"
+
+[[platforms.trajectory.maneuvers]]
+kind = "climb"
+vertical_rate = "1500 ft/min"
+altitude = "FL120"
+
+[[platforms.trajectory.maneuvers]]
+kind = "speed"
+speed = "280 kt"
+
+[[platforms.trajectory.maneuvers]]
+kind = "turn"
+bank = "25 deg"
+direction = "left"
+by = "90 deg"
+
+[[platforms.trajectory.maneuvers]]
+kind = "climb"
+angle = "-3 deg"
+duration = "60 s"
+
+# A waypoint route, flown over each waypoint.
+[[platforms]]
+name = "ac2"
+position = { lat = 50.8, lon = -1.6, alt = "3000 ft MSL" }
+
+[platforms.trajectory]
+kind = "route"
+speed = "200 kt"
+limits = { bank = "20 deg", climb_rate = "1000 ft/min" }
+
+[[platforms.trajectory.waypoints]]
+lat = 50.9
+lon = -1.3
+alt = "4000 ft MSL"
+speed = "220 kt"
+
+[[platforms.trajectory.waypoints]]
+lat = 51.05
+lon = -1.25
+alt = "4000 ft MSL"
+
+[[platforms.trajectory.waypoints]]
+lat = 51.0
+lon = -0.9
+alt = "FL060"
+
+# A recorded track, smoothed with a 2 s time constant.
+[[platforms]]
+name = "ac3"
+
+[platforms.trajectory]
+kind = "track"
+smoothing = "2 s"
+points = [
+  { time = "0 s", lat = 51.30000, lon = -0.80000, alt = "2000 m HAE" },
+  { time = "4 s", lat = 51.30360, lon = -0.80000, alt = "2001 m HAE" },
+  { time = "8 s", lat = 51.30720, lon = -0.79990, alt = "2002 m HAE" },
+  { time = "12 s", lat = 51.31075, lon = -0.79950, alt = "2003 m HAE" },
+  { time = "16 s", lat = 51.31420, lon = -0.79870, alt = "2004 m HAE" },
+  { time = "20 s", lat = 51.31750, lon = -0.79740, alt = "2005 m HAE" },
+]
+
+# A ground vehicle on waypoints at 2 m AGL (the ground is the ellipsoid until
+# terrain exists).
+[[platforms]]
+name = "truck"
+position = { lat = 51.01, lon = -1.01, alt = "2 m AGL" }
+
+[platforms.trajectory]
+kind = "ground"
+speed = "15 m/s"
+
+[[platforms.trajectory.waypoints]]
+lat = 51.015
+lon = -1.0
+alt = "2 m AGL"
+speed = "10 m/s"
+
+[[platforms.trajectory.waypoints]]
+lat = 51.015
+lon = -0.99
+alt = "2 m AGL"

@@ -267,3 +267,93 @@ fn world_table() {
     assert!(!errors("[world]\npressure_offset = \"5 hpa\"\n").is_empty());
     assert!(!errors("[world]\ngeoid_path = \"x\"\n").is_empty());
 }
+
+#[test]
+fn trajectory_example_is_clean() {
+    let source = include_str!("../../../examples/trajectories.toml");
+    let found: Vec<String> = lint(source).into_iter().map(|d| d.message).collect();
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn trajectory_fields_follow_their_kind() {
+    let body = r#"
+[[platforms]]
+name = "s"
+position = { lat = 0, lon = 0, alt = "0 m ellipsoid" }
+trajectory = { kind = "static", speed = "100 kt", limits = { accel = "1 m/s²" } }
+
+[[platforms]]
+name = "m"
+position = { lat = 0, lon = 0, alt = "FL100" }
+[platforms.trajectory]
+kind = "maneuvers"
+speed = "0.5 m/s"
+attitude = { heading = "10 deg" }
+smoothing = "1 s"
+limits = { bank = "85 deg", jerk = "0 m/s³" }
+[[platforms.trajectory.maneuvers]]
+kind = "turn"
+rate = "3 deg/s"
+bank = "20 deg"
+duration = "10 s"
+[[platforms.trajectory.maneuvers]]
+kind = "climb"
+vertical_rate = "0 ft/min"
+altitude = "FL120"
+speed = "200 kt"
+[[platforms.trajectory.maneuvers]]
+kind = "straight"
+direction = "left"
+
+[[platforms]]
+name = "t"
+position = { lat = 0, lon = 0, alt = "0 m ellipsoid" }
+[platforms.trajectory]
+kind = "track"
+points = [
+  { time = "1 s", lat = 0, lon = 0, alt = "0 m HAE" },
+  { time = "1 s", lat = 0, lon = 0.001, alt = "0 m HAE" },
+]
+
+[[platforms]]
+name = "g"
+position = { lat = 0, lon = 0, alt = "0 m MSL" }
+[platforms.trajectory]
+kind = "ground"
+speed = "10 m/s"
+heading = "0 deg"
+angle_of_attack = "1 deg"
+[[platforms.trajectory.maneuvers]]
+kind = "climb"
+angle = "1 deg"
+duration = "5 s"
+"#;
+    let found = errors(body);
+    let messages: Vec<&str> = found.iter().map(|(_, _, m)| m.as_str()).collect();
+    let expect = [
+        "platform \"s\": `speed` does not apply to a static trajectory",
+        "platform \"s\": a static trajectory has no limits",
+        "platform \"m\": a maneuvers trajectory needs `heading`",
+        "platform \"m\": `attitude` does not apply to a maneuvers trajectory",
+        "platform \"m\": `smoothing` does not apply to a maneuvers trajectory",
+        "platform \"m\": the speed must be at least 1 m/s",
+        "platform \"m\": limits.bank must be between 0° and 80°",
+        "platform \"m\": limits.jerk must be positive",
+        "platform \"m\", maneuver 1: a turn maneuver needs exactly one of `rate`, `bank`",
+        "platform \"m\", maneuver 1: a turn by duration or by angle needs a `direction`",
+        "platform \"m\", maneuver 2: `speed` does not apply to a climb maneuver",
+        "platform \"m\", maneuver 2: the vertical rate cannot be zero",
+        "platform \"m\", maneuver 3: `direction` only applies to a turn",
+        "platform \"m\", maneuver 3: a straight maneuver needs exactly one of `duration`",
+        "platform \"t\": a track trajectory starts at its first point; remove `position`",
+        "platform \"t\": track point times must increase",
+        "platform \"g\": a ground platform's altitude must be AGL (its height above the ground)",
+        "platform \"g\": `angle_of_attack` does not apply to a ground trajectory",
+        "platform \"g\", maneuver 1: a ground platform cannot climb",
+    ];
+    for e in expect {
+        assert!(messages.contains(&e), "missing {e:?} in {messages:#?}");
+    }
+    assert_eq!(messages.len(), expect.len(), "{messages:#?}");
+}

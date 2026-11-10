@@ -46,9 +46,9 @@ use iqsim_receiver::{
 };
 use iqsim_scenario::{
     ClockModel, EndPolicySpec, IqFileSpec, LoModel, NormalizationSpec, ResponseDetail,
-    SampleFormatSpec, Scenario, SinkKind,
+    SampleFormatSpec, Scenario, SinkKind, TrajectoryKind,
 };
-use iqsim_units::{AltitudeRef, Frequency, Position};
+use iqsim_units::{Frequency, Position};
 use iqsim_waveform::continuous::source_response;
 use iqsim_waveform::{EndPolicy, SourceTimeline};
 use serde::Serialize;
@@ -473,15 +473,9 @@ fn ecef(position: &Position, model: &AltitudeModel, what: &str) -> Result<[f64; 
     );
     let (lat_rad, lon_rad) = (lat.to_radians(), lon.to_radians());
     let geo = |e: iqsim_geo::GeoError| ResolveError(format!("{what}: {e}"));
-    let h = match alt.reference() {
-        AltitudeRef::Ellipsoid | AltitudeRef::Agl => alt.meters(),
-        AltitudeRef::Msl => model
-            .ellipsoid_height_from_msl_m(lat_rad, lon_rad, alt.meters())
-            .map_err(geo)?,
-        AltitudeRef::PressureStd => model
-            .ellipsoid_height_from_pressure_altitude_m(lat_rad, lon_rad, alt.meters())
-            .map_err(geo)?,
-    };
+    let h = model
+        .ellipsoid_height_m(lat_rad, lon_rad, alt)
+        .map_err(geo)?;
     let e = Ecef::from_geodetic(lat, lon, h);
     Ok([e.x, e.y, e.z])
 }
@@ -581,7 +575,11 @@ fn platform_position(
         .iter()
         .find(|p| p.name.as_str() == name)
         .ok_or_else(|| ResolveError(format!("{owner}: unknown platform \"{name}\"")))?;
-    ecef(&p.position, model, owner)
+    let position = p
+        .position
+        .as_ref()
+        .ok_or_else(|| ResolveError(format!("{owner}: platform \"{name}\" has no position")))?;
+    ecef(position, model, owner)
 }
 
 /// Resolves a parsed, lint-clean scenario. Relative input paths are taken from
@@ -599,6 +597,17 @@ pub fn resolve(scenario: &Scenario, base: &Path) -> Result<ResolvedScenario, Res
         return err("render duration and block must be positive");
     }
     let (world, model) = resolve_world(scenario, base)?;
+    for p in &scenario.platforms {
+        // Build every trajectory so its errors surface, then refuse motion: the static
+        // geometry below cannot render it (prompt 9 replaces it).
+        crate::trajectory::build(p, &model)?;
+        if p.trajectory.kind != TrajectoryKind::Static {
+            return err(format!(
+                "platform \"{}\": moving platforms are not rendered yet (`sim run` supports static platforms until the light-time geometry engine, prompt 9)",
+                p.name.as_str()
+            ));
+        }
+    }
 
     let mut emitters = Vec::new();
     for e in &scenario.emitters {

@@ -22,7 +22,10 @@
 //! | [`Power`] | W, mW, dBm, dBW | f64 W |
 //! | [`Gain`] | dB, dBi | f64 dB |
 //! | [`Distance`] | m, km, ft, nmi | f64 m |
-//! | [`Speed`] | m/s, km/h, kt | f64 m/s |
+//! | [`Speed`] | m/s, km/h, kt, ft/min | f64 m/s |
+//! | [`AngularRate`] | deg/s, °/s, rad/s | f64 deg/s |
+//! | [`Acceleration`] | m/s², m/s^2, g | f64 m/s² |
+//! | [`Jerk`] | m/s³, m/s^3 | f64 m/s³ |
 //! | [`Pressure`] | Pa, hPa, mbar, inHg | f64 Pa |
 //! | [`Angle`] | deg, °, rad, DMS | f64 deg |
 //! | [`Altitude`] | m, km, ft, nmi + MSL/AGL/ellipsoid, or FL | f64 m + reference |
@@ -47,6 +50,6 @@ pub mod utm;
 pub use angle::{Angle, Latitude, Longitude};
 pub use error::{QuantityKind, UnitError};
 pub use exact::{DataRate, Duration, Frequency, SampleRate};
-pub use float::{Distance, Gain, Power, Pressure, Speed};
+pub use float::{Acceleration, AngularRate, Distance, Gain, Jerk, Power, Pressure, Speed};
 pub use mgrs::{Mgrs, MgrsError, MgrsErrorKind};
 pub use position::{Altitude, AltitudeRef, Position, PositionError};

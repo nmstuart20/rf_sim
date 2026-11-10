@@ -567,3 +567,100 @@ Append one entry per prompt. Newest at the bottom. Each entry covers what was bu
 - AGL with a geoid grid but no terrain: should AGL mean "above MSL" (ground at the geoid) until phase 8? Kept as ellipsoidal to avoid reaching ahead.
 - Light time (prompt 9) will call `EarthOrientation::at` at retarded instants; `AcqInstant` arithmetic for `t − τ` with sub-ps τ needs a helper there.
 - Geoid grids are held in memory as u16 (EGM2008 1′ is 466 MB). A memory-mapped or tiled reader could come with terrain (phase 8).
+
+---
+
+## Prompt 8: Trajectories and attitude (2026-11-09)
+
+**Built** (`iqsim-geo::trajectory`, f64 through `libm`, fixed operation order; contracts §13)
+
+- `Trajectory` trait: `state(AcqInstant)` (pure, any instant in `span()`, fractional ps allowed), `state_at(TruthTime)`, `span()` and `knots(from, to)` (jerk discontinuities, for prompt 9's split points). `State` carries:
+  - ECEF position, velocity and acceleration;
+  - `q_ecef_body`, with `q_ned_body()` and `pose()` for the NED form;
+  - body-axis angular rate relative to ECEF.
+- `piece`: `Path` of quintic `Piece`s with integer-ps knots. Quintic Hermite construction, Horner evaluation of p, v, a, j, and `truncate_at` that keeps the past bit-identical.
+- `profile`: `Channel` (phases of constant second derivative with an exact integral), plus three planners:
+  - `scurve`, closed form from any (x₀, ẋ₀);
+  - `ramp`;
+  - `move_by`, rise-hold-fall with a prescribed integral (bisection on the peak).
+- `earth` (crate-private): n-vector point, radii, the pole-smooth curvature map K, and track angles.
+- `flight`: `Flight` with five entry points:
+  - `maneuvers`: straight, turn by rate/bank to duration/heading/angle, climb by rate/angle to altitude/duration, and speed;
+  - `route`: fly-over waypoints;
+  - `track`;
+  - `append` and `append_route`: runtime maneuvers from the state at t;
+  - `extend_to`.
+
+  Horizontal motion is an n-vector ODE (parallel transport plus turn rate) under RK4, sampled into Hermite nodes at ≤ 1 s and at every channel breakpoint.
+- `attitude`: derived attitude from (p, v, a, j), in three modes:
+  - `Derived`: heading from the air-relative track with a constant wind (crab), pitch = flight-path angle + α, bank `atan2(a·y_H, g₀)`, and the angular rate in closed form;
+  - `Ground`: no bank, pitch along the slope;
+  - `Fixed`.
+- `route`: two-variable shooting per leg on turn angle and duration, to 10⁻⁴ m.
+- `spline` (written by Codex CLI to my spec in a separate git worktree, reviewed, unchanged): Reinsch natural smoothing spline, banded LDLᵀ, `λ = τ⁴/Δt̄`.
+- `Static`; `Ground` trait with the `FlatGround` placeholder; `Heights` (geoid and atmosphere, plus ground for AGL); `AltitudeModel::ellipsoid_height_m` for every altitude reference (the runtime's old private conversion moved here, same bits).
+- `iqsim-units`: `Speed` gains `ft/min`; new `AngularRate`, `Acceleration` (incl. `g`) and `Jerk`.
+- `iqsim-scenario`:
+  - `[platforms.trajectory]` with kinds static, maneuvers, route, track and ground, plus maneuvers, waypoints, track points, limits, wind, AoA and a static attitude;
+  - lint rules for every kind/field combination (§11.4);
+  - `Platform.position` is now optional (a track starts at its first point);
+  - schema regenerated.
+- `iqsim-runtime`: `trajectory::build` (scenario → `Box<dyn Trajectory>`). Resolution builds every platform's trajectory, then rejects moving ones explicitly (`sim run` stays static until prompt 9).
+- `examples/trajectories.toml`: one platform of each kind; it lints clean.
+- Tests: geo 17 trajectory integration tests (5 of them review regressions) plus unit tests in every new module (S-curve and move_by proptests at 2048 cases, Hermite, truncation, curvature against finite differences, spline 9), units 1, scenario 2, runtime 2. Measured:
+  - **C2 at every joint** of a flight using every primitive kind, of the routes, of an interpolated track, and after appends (including mid-transition and after a track). The checks are one-sided second-order finite differences of position on each side (v within 2·10⁻⁵ m/s, a within 2·10⁻³ m/s²) and state at t − 1 ps against t. Knot values match to rounding (largest jumps 0 m, 2·10⁻¹² m/s, 6·10⁻¹² m/s²).
+  - **Coordinated-turn bank within 0.01°** of atan(Vω/g₀) at five latitudes (0° to 89.5°) and three speeds, by rate and by bank.
+  - **Routes pass through waypoints** within 1 cm horizontally and vertically, with the speed reached: England (4 waypoints, climbs, descents, speed changes), across the dateline, and over the North Pole.
+  - **Replay preserves timing**: interpolated track positions at the timestamps within 1 µm, span = [t₀, tₙ]; smoothed (τ = 2 s) closest approach at each timestamp within 10 ms, mean offset < 0.2 ms.
+  - Angular rate against quaternion differences within 2·10⁻⁶ rad/s, in all three modes (with wind and AoA too).
+  - Turn-to-heading final track within 10⁻⁹ rad; climb to altitude levels within 10⁻⁵ m.
+  - Wind crab exactly −atan(20/100); AoA pitch offset.
+  - Append leaves 2000 earlier states bit-identical, and a failed append leaves the flight unchanged.
+  - Ground platforms never bank or leave their AGL height.
+  - Out-of-span errors; rebuilding gives identical pieces.
+  - Spline gains 0.500 000 03 (ωτ = 1) and 0.941 176 48 (ωτ = 0.5) against 1/(1+(ωτ)⁴).
+  - **No golden hash changed.**
+
+**Contracts changed** (numeric contract still version 0)
+
+- New §13 (trait and state conventions, piece representation, n-vector ODE, channels and defaults, derived attitude, routes, track smoothing parameter, static/ground/append semantics).
+- §11.2: new units. §11.4: trajectory fields and lint rules, optional `position`, what `sim run` supports. §9: placement.
+
+**Decisions and deviations**
+
+- **"Straight" is a geodesic with zero lateral acceleration (parallel transport), not a rhumb line.** That is what a wings-level aircraft flies, and it makes the bank formula exact. Consequently "turn by Δ" is relative to straight flight, while "turn to heading" shoots on the final track.
+- **Bank uses g₀ and the Earth-fixed lateral acceleration**, exactly the design's `tan φ = Vω/g`. The specific force's curvature term (V²/R ≈ 0.01 m/s²) would shift a 30° bank by 0.025°, more than the 0.01° check allows, so it is deliberately excluded and documented.
+- **One attitude function for every source** (maneuvers, routes, tracks, appends), driven by p, v, a, j rather than by the commanded channels, so attitude can never disagree with the motion.
+- **Appends restart from (p, v, a)**, not from stored channel state, so they work from any source (a track, a route, mid-transition). The ~10⁻⁷ m geodetic round trip is absorbed in the first new piece; the join stays C2.
+- **Each primitive commands all three channels** and settles the unnamed ones (level, wings level, constant speed). Simultaneous channels (turn + climb + speed) are used inside route legs but are not a scenario primitive.
+- **Durations:** a primitive lasts until its transitions finish or its duration, whichever is later; turns and climbs by duration fail if too short.
+- **Altitude targets of climbs** convert at the climb's start point, then hold constant ellipsoid height. Waypoint altitudes convert at the waypoint.
+- **Routes are fly-over** with turns starting at the waypoint; fly-by anticipation was not needed for "passes through waypoints".
+- **Tracks are inline** (`points = [...]`); no track file, so nothing new to hash in the manifest yet.
+- **Ground-clamped** = maneuvers without climbs or AGL waypoints over `FlatGround` (the ellipsoid, as AGL resolves today).
+- **Units:** vertical rates and accelerations needed `ft/min`, `AngularRate`, `Acceleration` and `Jerk`.
+- **`position` became optional** in the schema, enforced by lint, because a track's start is its first point; requiring a position there would have meant a second, conflicting start.
+
+**Independent review (Codex CLI, `high` reasoning, read-only)**
+
+- Codex also wrote `spline.rs` to my spec in a separate git worktree. I reviewed the Reinsch formulation, the λ > 1 rescaling, the trend removal and the banded LDLᵀ, and changed nothing.
+- My own testing caught a sign error in the Hermite `c5` term (`+(a₁ − a₀)T²`) before the review.
+- The review found three P1 and three P2 issues. All are fixed, each with a regression test. No golden changed.
+  - **P1, no-op primitives.** A speed change to the current speed (or a turn to the current heading) made a zero-length piece, which divided by zero (NaN in release, a debug-assert panic otherwise). Zero-length segments now add no piece, and `Piece::hermite` returns an error for a non-positive length.
+  - **P1, antipodal "arrival".** The route's tangent-plane miss of an antipodal waypoint is ~0, so the leg was accepted 12 756 km short. Misses beyond 10⁻³ rad are now surface arcs, arrival also needs the 3-D distance, and an antipodal waypoint is an error. A 2000 km leg behind the start now converges.
+  - **P1, short segments.** Rounding of Earth-sized positions divided by T² and T³ gave ~6·10³ m/s² in a 1 µs segment. Pieces under 0.1 s now take their displacement from the end velocities and accelerations. Segments are at least 1 ms (an explicit shorter duration is an error), and appends 0.3 ms after a knot stay smooth.
+  - **P2, fast turns.** At 1 m/s an accepted 79° bank is ~50 rad/s, so a 0.125 s RK4 step turned the wrong way and 1 s nodes could not follow the motion. RK steps are now ≤ 0.02 rad of turn and nodes ≤ 0.1 rad. A 60° bank at 2 m/s (8.5 rad/s) holds speed within 10⁻⁶ m/s and bank within 0.01°.
+  - **P2, `move_by` monotonicity.** With a non-zero start rate and acceleration the integral has interior extrema, so a reachable climb (+0.05 m from 0.4 m/s, −0.5 m/s²) was rejected. The peak range is now scanned for a sign change before bisection.
+  - **P2, time overflow.** `extend_to(TruthTime::MAX)` from `TruthTime::MIN` overflowed i64. It now uses a checked subtraction, piece lengths are computed in i128, and the end of a maneuver is checked.
+
+**Dependencies**
+
+- No new external crates.
+
+**Open questions**
+
+- **Light-time lookback (prompt 9):** emission times before a trajectory's `start` are outside its span. Prompt 9 must choose between starting maneuvers earlier (`start` negative), extrapolating straight and level backwards, or resolving with a margin.
+- **Track files:** large recorded tracks want a file format (CSV or similar) registered as a manifest asset; inline points only for now.
+- **Stops:** derived attitude needs ≥ 0.1 m/s and maneuvers ≥ 1 m/s, so ground vehicles cannot stop yet; a held-heading mode at rest would be needed.
+- **Terrain clamp (prompt 22):** the clamped height must be C2 along the path; bilinear DTED is only C0, so it will need smoothing or a C2 interpolant.
+- **Wind** is constant and horizontal; gusts and wind fields are out of scope.

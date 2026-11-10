@@ -4,7 +4,10 @@
 //! choices that exist today (for example `clock = { model = "ideal" }`); later
 //! prompts add variants and fields without changing the surrounding layout.
 
-use iqsim_units::{DataRate, Duration, Frequency, Gain, Position, Power, Pressure, SampleRate};
+use iqsim_units::{
+    Acceleration, Altitude, Angle, AngularRate, DataRate, Duration, Frequency, Gain, Jerk,
+    Latitude, Longitude, Position, Power, Pressure, SampleRate, Speed,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use toml::Spanned;
@@ -220,9 +223,10 @@ pub struct Library {
 pub struct Platform {
     /// Unique entity name.
     pub name: Ident,
-    /// Initial position.
-    pub position: Position,
-    /// Motion model (placeholder: only `static`).
+    /// Initial position (required, except for `track` trajectories, which start at
+    /// their first point).
+    pub position: Option<Position>,
+    /// Motion model (default `static`).
     #[serde(default)]
     pub trajectory: Trajectory,
     /// Antenna mounts on the platform body.
@@ -230,12 +234,52 @@ pub struct Platform {
     pub mounts: Vec<Mount>,
 }
 
-/// A platform motion model (placeholder).
+/// A platform motion model (contracts §13). Which fields apply depends on `kind`;
+/// `sim lint` rejects the others.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Trajectory {
-    /// The trajectory kind.
+    /// The trajectory kind (default `static`).
+    #[serde(default)]
     pub kind: TrajectoryKind,
+    /// Truth time of the initial state (maneuvers, route, ground; default 0 s).
+    #[schemars(with = "Option<Duration>")]
+    pub start: Option<Spanned<Duration>>,
+    /// Initial track angle from true north (maneuvers and ground: required; route:
+    /// default towards the first waypoint).
+    #[schemars(with = "Option<Angle>")]
+    pub heading: Option<Spanned<Angle>>,
+    /// Initial speed (maneuvers, route, ground: required).
+    #[schemars(with = "Option<Speed>")]
+    pub speed: Option<Spanned<Speed>>,
+    /// Fixed attitude of a static platform (default: nose north, level).
+    #[schemars(with = "Option<AttitudeSpec>")]
+    pub attitude: Option<Spanned<AttitudeSpec>>,
+    /// Angle of attack added to the derived pitch (airborne kinds; default 0°).
+    #[schemars(with = "Option<Angle>")]
+    pub angle_of_attack: Option<Spanned<Angle>>,
+    /// Constant wind, which crabs the derived heading (airborne kinds; default none).
+    #[schemars(with = "Option<WindSpec>")]
+    pub wind: Option<Spanned<WindSpec>>,
+    /// Performance limits and route defaults.
+    #[serde(default)]
+    pub limits: LimitsSpec,
+    /// Maneuver primitives, flown in order (maneuvers; ground).
+    #[serde(default)]
+    #[schemars(with = "Vec<ManeuverSpec>")]
+    pub maneuvers: Vec<Spanned<ManeuverSpec>>,
+    /// Waypoints, flown over in order (route; ground).
+    #[serde(default)]
+    #[schemars(with = "Vec<WaypointSpec>")]
+    pub waypoints: Vec<Spanned<WaypointSpec>>,
+    /// Recorded positions, in increasing time order (track; at least two).
+    #[serde(default)]
+    #[schemars(with = "Vec<TrackPointSpec>")]
+    pub points: Vec<Spanned<TrackPointSpec>>,
+    /// Track smoothing time constant τ (default 0 s, which interpolates the points).
+    /// Motion faster than 1/τ rad/s is attenuated by 1/(1 + (ωτ)⁴).
+    #[schemars(with = "Option<Duration>")]
+    pub smoothing: Option<Spanned<Duration>>,
 }
 
 /// Available motion models.
@@ -245,6 +289,164 @@ pub enum TrajectoryKind {
     /// The platform stays at its position.
     #[default]
     Static,
+    /// Maneuver primitives from an initial heading and speed.
+    Maneuvers,
+    /// A waypoint route.
+    Route,
+    /// A recorded track, smoothed to C2.
+    Track,
+    /// A ground vehicle, clamped to the ground (the ellipsoid until terrain exists):
+    /// maneuvers without climbs, or waypoints at AGL heights.
+    Ground,
+}
+
+/// A fixed attitude relative to local north-east-down.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttitudeSpec {
+    /// Heading (yaw) from true north (default 0°).
+    pub heading: Option<Angle>,
+    /// Pitch, nose up positive (default 0°).
+    pub pitch: Option<Angle>,
+    /// Roll, right wing down positive (default 0°).
+    pub roll: Option<Angle>,
+}
+
+/// A constant wind.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WindSpec {
+    /// Wind speed.
+    pub speed: Speed,
+    /// Direction the wind blows from, from true north.
+    pub from: Angle,
+}
+
+/// Performance limits (contracts §13.4 has the defaults).
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSpec {
+    /// Bank angle of route turns (default 25°, below 80°).
+    #[schemars(with = "Option<Angle>")]
+    pub bank: Option<Spanned<Angle>>,
+    /// Roll rate (default 10 deg/s).
+    #[schemars(with = "Option<AngularRate>")]
+    pub roll_rate: Option<Spanned<AngularRate>>,
+    /// Largest acceleration in speed changes (default 1 m/s²).
+    #[schemars(with = "Option<Acceleration>")]
+    pub accel: Option<Spanned<Acceleration>>,
+    /// Jerk in speed changes (default 0.5 m/s³).
+    #[schemars(with = "Option<Jerk>")]
+    pub jerk: Option<Spanned<Jerk>>,
+    /// Largest vertical acceleration (default 0.5 m/s²).
+    #[schemars(with = "Option<Acceleration>")]
+    pub vertical_accel: Option<Spanned<Acceleration>>,
+    /// Vertical jerk (default 0.25 m/s³).
+    #[schemars(with = "Option<Jerk>")]
+    pub vertical_jerk: Option<Spanned<Jerk>>,
+    /// Route climb and descent rate (default 1500 ft/min).
+    #[schemars(with = "Option<Speed>")]
+    pub climb_rate: Option<Spanned<Speed>>,
+}
+
+/// One maneuver primitive.
+///
+/// - `straight`: `duration`.
+/// - `turn`: `rate` or `bank`; then `duration`, `heading` or `by`; `direction` is
+///   required with `duration` and `by` (with `heading` the default is the shortest
+///   way).
+/// - `climb`: `vertical_rate` or `angle` (negative descends); then `altitude` or
+///   `duration`.
+/// - `speed`: `speed`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManeuverSpec {
+    /// The primitive.
+    pub kind: ManeuverKind,
+    /// Total duration (straight; turn and climb by duration).
+    #[schemars(with = "Option<Duration>")]
+    pub duration: Option<Spanned<Duration>>,
+    /// Turn rate.
+    #[schemars(with = "Option<AngularRate>")]
+    pub rate: Option<Spanned<AngularRate>>,
+    /// Turn bank angle.
+    #[schemars(with = "Option<Angle>")]
+    pub bank: Option<Spanned<Angle>>,
+    /// Turn direction.
+    pub direction: Option<DirectionSpec>,
+    /// Turn to this track angle.
+    #[schemars(with = "Option<Angle>")]
+    pub heading: Option<Spanned<Angle>>,
+    /// Turn by this angle relative to a straight path.
+    #[schemars(with = "Option<Angle>")]
+    pub by: Option<Spanned<Angle>>,
+    /// Climb or descent rate.
+    #[schemars(with = "Option<Speed>")]
+    pub vertical_rate: Option<Spanned<Speed>>,
+    /// Climb or descent flight-path angle.
+    #[schemars(with = "Option<Angle>")]
+    pub angle: Option<Spanned<Angle>>,
+    /// Level off at this altitude.
+    #[schemars(with = "Option<Altitude>")]
+    pub altitude: Option<Spanned<Altitude>>,
+    /// Target speed.
+    #[schemars(with = "Option<Speed>")]
+    pub speed: Option<Spanned<Speed>>,
+}
+
+/// Maneuver primitives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ManeuverKind {
+    /// Straight and level.
+    Straight,
+    /// A coordinated, level turn.
+    Turn,
+    /// A straight climb or descent.
+    Climb,
+    /// A straight, level speed change.
+    Speed,
+}
+
+/// Turn directions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectionSpec {
+    /// Counter-clockwise seen from above.
+    Left,
+    /// Clockwise seen from above.
+    Right,
+}
+
+/// A route waypoint.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WaypointSpec {
+    /// Latitude.
+    pub lat: Latitude,
+    /// Longitude.
+    pub lon: Longitude,
+    /// Altitude reached by the waypoint (AGL for ground platforms).
+    #[schemars(with = "Altitude")]
+    pub alt: Spanned<Altitude>,
+    /// Speed reached by the waypoint (default: unchanged).
+    #[schemars(with = "Option<Speed>")]
+    pub speed: Option<Spanned<Speed>>,
+}
+
+/// A recorded track position.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TrackPointSpec {
+    /// Truth time of the fix.
+    #[schemars(with = "Duration")]
+    pub time: Spanned<Duration>,
+    /// Latitude.
+    pub lat: Latitude,
+    /// Longitude.
+    pub lon: Longitude,
+    /// Altitude.
+    pub alt: Altitude,
 }
 
 /// An antenna mount on a platform (placeholder: lever arm and orientation come later).

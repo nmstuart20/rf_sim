@@ -234,11 +234,12 @@ text_quantity_impls!(Distance, Some(unit_pattern(DISTANCE.units)));
 
 static SPEED: QuantityKind = QuantityKind {
     name: "speed",
-    units: &["m/s", "km/h", "kt"],
+    units: &["m/s", "km/h", "kt", "ft/min"],
     example: "250 kt",
 };
 
-/// A signed speed in metres per second. Units: m/s, km/h, kt (1852/3600 m/s).
+/// A signed speed in metres per second. Units: m/s, km/h, kt (1852/3600 m/s), ft/min
+/// (0.3048/60 m/s, for vertical rates).
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct Speed {
     meters_per_second: f64,
@@ -269,6 +270,7 @@ impl TextQuantity for Speed {
             "m/s" => exact_f64(kind, text, value, 1, 0)?,
             "km/h" => exact_f64(kind, text, value, 1000, 0)? / 3600.0,
             "kt" => exact_f64(kind, text, value, 1852, 0)? / 3600.0,
+            "ft/min" => exact_f64(kind, text, value, 3048, -4)? / 60.0,
             _ => return Err(unknown(kind, unit)),
         };
         Ok(Self { meters_per_second })
@@ -333,6 +335,168 @@ impl fmt::Display for Pressure {
 
 text_quantity_impls!(Pressure, Some(unit_pattern(PRESSURE.units)));
 
+// ---------------------------------------------------------------- Angular rate
+
+static ANGULAR_RATE: QuantityKind = QuantityKind {
+    name: "angular rate",
+    units: &["deg/s", "°/s", "rad/s"],
+    example: "3 deg/s",
+};
+
+/// A signed angular rate in degrees per second. Units: deg/s, °/s, rad/s.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct AngularRate {
+    degrees_per_second: f64,
+}
+
+impl AngularRate {
+    /// A rate of `degrees_per_second`. `None` unless finite.
+    pub fn from_degrees_per_second(degrees_per_second: f64) -> Option<Self> {
+        degrees_per_second
+            .is_finite()
+            .then_some(Self { degrees_per_second })
+    }
+
+    /// The rate in degrees per second.
+    pub fn degrees_per_second(self) -> f64 {
+        self.degrees_per_second
+    }
+
+    /// The rate in radians per second.
+    pub fn radians_per_second(self) -> f64 {
+        self.degrees_per_second.to_radians()
+    }
+}
+
+impl TextQuantity for AngularRate {
+    const KIND: &'static QuantityKind = &ANGULAR_RATE;
+
+    fn parse_text(text: &str) -> Result<Self, UnitError> {
+        let kind = Self::KIND;
+        let (value, unit) = number_and_unit(kind, text)?;
+        let degrees_per_second = match unit {
+            "deg/s" | "°/s" => exact_f64(kind, text, value, 1, 0)?,
+            "rad/s" => finite(kind, text, exact_f64(kind, text, value, 1, 0)?.to_degrees())?,
+            _ => return Err(unknown(kind, unit)),
+        };
+        Ok(Self { degrees_per_second })
+    }
+}
+
+impl fmt::Display for AngularRate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} deg/s", self.degrees_per_second)
+    }
+}
+
+text_quantity_impls!(AngularRate, Some(unit_pattern(ANGULAR_RATE.units)));
+
+// ---------------------------------------------------------------- Acceleration
+
+static ACCELERATION: QuantityKind = QuantityKind {
+    name: "acceleration",
+    units: &["m/s²", "m/s^2", "g"],
+    example: "1.5 m/s²",
+};
+
+/// A signed acceleration in m/s². Units: m/s² (also m/s^2), g (standard gravity,
+/// 9.806 65 m/s²).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Acceleration {
+    meters_per_second_squared: f64,
+}
+
+impl Acceleration {
+    /// An acceleration of `meters_per_second_squared`. `None` unless finite.
+    pub fn from_meters_per_second_squared(meters_per_second_squared: f64) -> Option<Self> {
+        meters_per_second_squared.is_finite().then_some(Self {
+            meters_per_second_squared,
+        })
+    }
+
+    /// The acceleration in m/s².
+    pub fn meters_per_second_squared(self) -> f64 {
+        self.meters_per_second_squared
+    }
+}
+
+impl TextQuantity for Acceleration {
+    const KIND: &'static QuantityKind = &ACCELERATION;
+
+    fn parse_text(text: &str) -> Result<Self, UnitError> {
+        let kind = Self::KIND;
+        let (value, unit) = number_and_unit(kind, text)?;
+        let meters_per_second_squared = match unit {
+            "m/s²" | "m/s^2" => exact_f64(kind, text, value, 1, 0)?,
+            "g" => exact_f64(kind, text, value, 980_665, -5)?,
+            _ => return Err(unknown(kind, unit)),
+        };
+        Ok(Self {
+            meters_per_second_squared,
+        })
+    }
+}
+
+impl fmt::Display for Acceleration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} m/s²", self.meters_per_second_squared)
+    }
+}
+
+text_quantity_impls!(Acceleration, Some(unit_pattern(ACCELERATION.units)));
+
+// ---------------------------------------------------------------- Jerk
+
+static JERK: QuantityKind = QuantityKind {
+    name: "jerk",
+    units: &["m/s³", "m/s^3"],
+    example: "0.5 m/s³",
+};
+
+/// A signed jerk (rate of change of acceleration) in m/s³. Units: m/s³ (also m/s^3).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Jerk {
+    meters_per_second_cubed: f64,
+}
+
+impl Jerk {
+    /// A jerk of `meters_per_second_cubed`. `None` unless finite.
+    pub fn from_meters_per_second_cubed(meters_per_second_cubed: f64) -> Option<Self> {
+        meters_per_second_cubed.is_finite().then_some(Self {
+            meters_per_second_cubed,
+        })
+    }
+
+    /// The jerk in m/s³.
+    pub fn meters_per_second_cubed(self) -> f64 {
+        self.meters_per_second_cubed
+    }
+}
+
+impl TextQuantity for Jerk {
+    const KIND: &'static QuantityKind = &JERK;
+
+    fn parse_text(text: &str) -> Result<Self, UnitError> {
+        let kind = Self::KIND;
+        let (value, unit) = number_and_unit(kind, text)?;
+        let meters_per_second_cubed = match unit {
+            "m/s³" | "m/s^3" => exact_f64(kind, text, value, 1, 0)?,
+            _ => return Err(unknown(kind, unit)),
+        };
+        Ok(Self {
+            meters_per_second_cubed,
+        })
+    }
+}
+
+impl fmt::Display for Jerk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} m/s³", self.meters_per_second_cubed)
+    }
+}
+
+text_quantity_impls!(Jerk, Some(unit_pattern(JERK.units)));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +536,39 @@ mod tests {
         assert_eq!(v("36 km/h"), Ok(10.0));
         assert_eq!(v("-5 m/s"), Ok(-5.0));
         assert!(matches!(v("250 knots"), Err(UnitError::UnknownUnit { .. })));
+        assert_eq!(v("1500 ft/min"), Ok(457.2 / 60.0));
+        assert_eq!(v("-600 ft/min"), Ok(-3.048));
+    }
+
+    #[test]
+    fn rate_acceleration_jerk_units() {
+        let r = |s: &str| {
+            s.parse::<AngularRate>()
+                .map(AngularRate::degrees_per_second)
+        };
+        assert_eq!(r("3 deg/s"), Ok(3.0));
+        assert_eq!(r("-1.5 °/s"), Ok(-1.5));
+        assert!((r("1 rad/s").unwrap() - 57.295_779_513_082_32).abs() < 1e-12);
+        assert!(matches!(r("3 deg"), Err(UnitError::UnknownUnit { .. })));
+        let a = |s: &str| {
+            s.parse::<Acceleration>()
+                .map(Acceleration::meters_per_second_squared)
+        };
+        assert_eq!(a("1.5 m/s²"), Ok(1.5));
+        assert_eq!(a("2 m/s^2"), Ok(2.0));
+        assert_eq!(a("1 g"), Ok(9.806_65));
+        assert_eq!(a("0.1 g"), Ok(0.980_665));
+        let j = |s: &str| s.parse::<Jerk>().map(Jerk::meters_per_second_cubed);
+        assert_eq!(j("0.5 m/s³"), Ok(0.5));
+        assert_eq!(j("0.25 m/s^3"), Ok(0.25));
+        assert!(matches!(j("1 m/s²"), Err(UnitError::UnknownUnit { .. })));
+        // Display parses back.
+        let x: AngularRate = "0.1 rad/s".parse().unwrap();
+        assert_eq!(x.to_string().parse::<AngularRate>(), Ok(x));
+        let y: Acceleration = "0.3 g".parse().unwrap();
+        assert_eq!(y.to_string().parse::<Acceleration>(), Ok(y));
+        let z: Jerk = "0.7 m/s³".parse().unwrap();
+        assert_eq!(z.to_string().parse::<Jerk>(), Ok(z));
     }
 
     #[test]

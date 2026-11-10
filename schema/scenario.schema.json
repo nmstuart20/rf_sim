@@ -93,6 +93,14 @@
     "run_mode"
   ],
   "$defs": {
+    "Acceleration": {
+      "description": "A acceleration with a unit (m/s², m/s^2, g), written as a string, e.g. \"1.5 m/s²\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "1.5 m/s²"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:m/s²|m/s^2|g)\\s*$"
+    },
     "AdcSpec": {
       "description": "The virtual ADC (receiver chain stage 7).",
       "type": "object",
@@ -158,6 +166,14 @@
         "12.5 deg"
       ]
     },
+    "AngularRate": {
+      "description": "A angular rate with a unit (deg/s, °/s, rad/s), written as a string, e.g. \"3 deg/s\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "3 deg/s"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:deg/s|°/s|rad/s)\\s*$"
+    },
     "AntennaPort": {
       "description": "An antenna-port output: the field at an antenna, band-limited by B_out, with\nno virtual-receiver effects (contracts §5).",
       "type": "object",
@@ -210,6 +226,25 @@
         "sample_rate",
         "bandwidth"
       ]
+    },
+    "AttitudeSpec": {
+      "description": "A fixed attitude relative to local north-east-down.",
+      "type": "object",
+      "properties": {
+        "heading": {
+          "description": "Heading (yaw) from true north (default 0°).",
+          "$ref": "#/$defs/Angle"
+        },
+        "pitch": {
+          "description": "Pitch, nose up positive (default 0°).",
+          "$ref": "#/$defs/Angle"
+        },
+        "roll": {
+          "description": "Roll, right wing down positive (default 0°).",
+          "$ref": "#/$defs/Angle"
+        }
+      },
+      "additionalProperties": false
     },
     "Channel": {
       "description": "One tuned channel of a virtual receiver.",
@@ -350,6 +385,21 @@
       "additionalProperties": false,
       "required": [
         "factor"
+      ]
+    },
+    "DirectionSpec": {
+      "description": "Turn directions.",
+      "oneOf": [
+        {
+          "description": "Counter-clockwise seen from above.",
+          "type": "string",
+          "const": "left"
+        },
+        {
+          "description": "Clockwise seen from above.",
+          "type": "string",
+          "const": "right"
+        }
       ]
     },
     "Duration": {
@@ -548,6 +598,14 @@
       },
       "additionalProperties": false
     },
+    "Jerk": {
+      "description": "A jerk with a unit (m/s³, m/s^3), written as a string, e.g. \"0.5 m/s³\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "0.5 m/s³"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:m/s³|m/s^3)\\s*$"
+    },
     "Latitude": {
       "description": "latitude in degrees: a number (N positive) or a string in decimal degrees or degrees-minutes-seconds with an optional N/S letter, e.g. \"38°53'23.3\"N\".",
       "anyOf": [
@@ -580,6 +638,41 @@
       "description": "A library item name, resolved on the library search path: ASCII letters, digits, '_', '-', '.' and '/'.",
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_./-]*$"
+    },
+    "LimitsSpec": {
+      "description": "Performance limits (contracts §13.4 has the defaults).",
+      "type": "object",
+      "properties": {
+        "accel": {
+          "description": "Largest acceleration in speed changes (default 1 m/s²).",
+          "$ref": "#/$defs/Acceleration"
+        },
+        "bank": {
+          "description": "Bank angle of route turns (default 25°, below 80°).",
+          "$ref": "#/$defs/Angle"
+        },
+        "climb_rate": {
+          "description": "Route climb and descent rate (default 1500 ft/min).",
+          "$ref": "#/$defs/Speed"
+        },
+        "jerk": {
+          "description": "Jerk in speed changes (default 0.5 m/s³).",
+          "$ref": "#/$defs/Jerk"
+        },
+        "roll_rate": {
+          "description": "Roll rate (default 10 deg/s).",
+          "$ref": "#/$defs/AngularRate"
+        },
+        "vertical_accel": {
+          "description": "Largest vertical acceleration (default 0.5 m/s²).",
+          "$ref": "#/$defs/Acceleration"
+        },
+        "vertical_jerk": {
+          "description": "Vertical jerk (default 0.25 m/s³).",
+          "$ref": "#/$defs/Jerk"
+        }
+      },
+      "additionalProperties": false
     },
     "LoModel": {
       "description": "Available local-oscillator models.",
@@ -625,6 +718,85 @@
         {
           "type": "string"
         }
+      ]
+    },
+    "ManeuverKind": {
+      "description": "Maneuver primitives.",
+      "oneOf": [
+        {
+          "description": "Straight and level.",
+          "type": "string",
+          "const": "straight"
+        },
+        {
+          "description": "A coordinated, level turn.",
+          "type": "string",
+          "const": "turn"
+        },
+        {
+          "description": "A straight climb or descent.",
+          "type": "string",
+          "const": "climb"
+        },
+        {
+          "description": "A straight, level speed change.",
+          "type": "string",
+          "const": "speed"
+        }
+      ]
+    },
+    "ManeuverSpec": {
+      "description": "One maneuver primitive.\n\n- `straight`: `duration`.\n- `turn`: `rate` or `bank`; then `duration`, `heading` or `by`; `direction` is\n  required with `duration` and `by` (with `heading` the default is the shortest\n  way).\n- `climb`: `vertical_rate` or `angle` (negative descends); then `altitude` or\n  `duration`.\n- `speed`: `speed`.",
+      "type": "object",
+      "properties": {
+        "altitude": {
+          "description": "Level off at this altitude.",
+          "$ref": "#/$defs/Altitude"
+        },
+        "angle": {
+          "description": "Climb or descent flight-path angle.",
+          "$ref": "#/$defs/Angle"
+        },
+        "bank": {
+          "description": "Turn bank angle.",
+          "$ref": "#/$defs/Angle"
+        },
+        "by": {
+          "description": "Turn by this angle relative to a straight path.",
+          "$ref": "#/$defs/Angle"
+        },
+        "direction": {
+          "description": "Turn direction.",
+          "$ref": "#/$defs/DirectionSpec"
+        },
+        "duration": {
+          "description": "Total duration (straight; turn and climb by duration).",
+          "$ref": "#/$defs/Duration"
+        },
+        "heading": {
+          "description": "Turn to this track angle.",
+          "$ref": "#/$defs/Angle"
+        },
+        "kind": {
+          "description": "The primitive.",
+          "$ref": "#/$defs/ManeuverKind"
+        },
+        "rate": {
+          "description": "Turn rate.",
+          "$ref": "#/$defs/AngularRate"
+        },
+        "speed": {
+          "description": "Target speed.",
+          "$ref": "#/$defs/Speed"
+        },
+        "vertical_rate": {
+          "description": "Climb or descent rate.",
+          "$ref": "#/$defs/Speed"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
       ]
     },
     "Metadata": {
@@ -703,18 +875,17 @@
           "$ref": "#/$defs/Ident"
         },
         "position": {
-          "description": "Initial position.",
+          "description": "Initial position (required, except for `track` trajectories, which start at\ntheir first point).",
           "$ref": "#/$defs/Position"
         },
         "trajectory": {
-          "description": "Motion model (placeholder: only `static`).",
+          "description": "Motion model (default `static`).",
           "$ref": "#/$defs/Trajectory"
         }
       },
       "additionalProperties": false,
       "required": [
-        "name",
-        "position"
+        "name"
       ]
     },
     "Position": {
@@ -1019,19 +1190,106 @@
       },
       "additionalProperties": false
     },
-    "Trajectory": {
-      "description": "A platform motion model (placeholder).",
+    "Speed": {
+      "description": "A speed with a unit (m/s, km/h, kt, ft/min), written as a string, e.g. \"250 kt\". Units are case-sensitive.",
+      "type": "string",
+      "examples": [
+        "250 kt"
+      ],
+      "pattern": "^\\s*[-+]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?\\s*(?:m/s|km/h|kt|ft/min)\\s*$"
+    },
+    "TrackPointSpec": {
+      "description": "A recorded track position.",
       "type": "object",
       "properties": {
-        "kind": {
-          "description": "The trajectory kind.",
-          "$ref": "#/$defs/TrajectoryKind"
+        "alt": {
+          "description": "Altitude.",
+          "$ref": "#/$defs/Altitude"
+        },
+        "lat": {
+          "description": "Latitude.",
+          "$ref": "#/$defs/Latitude"
+        },
+        "lon": {
+          "description": "Longitude.",
+          "$ref": "#/$defs/Longitude"
+        },
+        "time": {
+          "description": "Truth time of the fix.",
+          "$ref": "#/$defs/Duration"
         }
       },
       "additionalProperties": false,
       "required": [
-        "kind"
+        "time",
+        "lat",
+        "lon",
+        "alt"
       ]
+    },
+    "Trajectory": {
+      "description": "A platform motion model (contracts §13). Which fields apply depends on `kind`;\n`sim lint` rejects the others.",
+      "type": "object",
+      "properties": {
+        "angle_of_attack": {
+          "description": "Angle of attack added to the derived pitch (airborne kinds; default 0°).",
+          "$ref": "#/$defs/Angle"
+        },
+        "attitude": {
+          "description": "Fixed attitude of a static platform (default: nose north, level).",
+          "$ref": "#/$defs/AttitudeSpec"
+        },
+        "heading": {
+          "description": "Initial track angle from true north (maneuvers and ground: required; route:\ndefault towards the first waypoint).",
+          "$ref": "#/$defs/Angle"
+        },
+        "kind": {
+          "description": "The trajectory kind (default `static`).",
+          "$ref": "#/$defs/TrajectoryKind"
+        },
+        "limits": {
+          "description": "Performance limits and route defaults.",
+          "$ref": "#/$defs/LimitsSpec"
+        },
+        "maneuvers": {
+          "description": "Maneuver primitives, flown in order (maneuvers; ground).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ManeuverSpec"
+          }
+        },
+        "points": {
+          "description": "Recorded positions, in increasing time order (track; at least two).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TrackPointSpec"
+          }
+        },
+        "smoothing": {
+          "description": "Track smoothing time constant τ (default 0 s, which interpolates the points).\nMotion faster than 1/τ rad/s is attenuated by 1/(1 + (ωτ)⁴).",
+          "$ref": "#/$defs/Duration"
+        },
+        "speed": {
+          "description": "Initial speed (maneuvers, route, ground: required).",
+          "$ref": "#/$defs/Speed"
+        },
+        "start": {
+          "description": "Truth time of the initial state (maneuvers, route, ground; default 0 s).",
+          "$ref": "#/$defs/Duration"
+        },
+        "waypoints": {
+          "description": "Waypoints, flown over in order (route; ground).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WaypointSpec"
+          }
+        },
+        "wind": {
+          "description": "Constant wind, which crabs the derived heading (airborne kinds; default none).",
+          "$ref": "#/$defs/WindSpec"
+        }
+      },
+      "additionalProperties": false
     },
     "TrajectoryKind": {
       "description": "Available motion models.",
@@ -1040,7 +1298,74 @@
           "description": "The platform stays at its position.",
           "type": "string",
           "const": "static"
+        },
+        {
+          "description": "Maneuver primitives from an initial heading and speed.",
+          "type": "string",
+          "const": "maneuvers"
+        },
+        {
+          "description": "A waypoint route.",
+          "type": "string",
+          "const": "route"
+        },
+        {
+          "description": "A recorded track, smoothed to C2.",
+          "type": "string",
+          "const": "track"
+        },
+        {
+          "description": "A ground vehicle, clamped to the ground (the ellipsoid until terrain exists):\nmaneuvers without climbs, or waypoints at AGL heights.",
+          "type": "string",
+          "const": "ground"
         }
+      ]
+    },
+    "WaypointSpec": {
+      "description": "A route waypoint.",
+      "type": "object",
+      "properties": {
+        "alt": {
+          "description": "Altitude reached by the waypoint (AGL for ground platforms).",
+          "$ref": "#/$defs/Altitude"
+        },
+        "lat": {
+          "description": "Latitude.",
+          "$ref": "#/$defs/Latitude"
+        },
+        "lon": {
+          "description": "Longitude.",
+          "$ref": "#/$defs/Longitude"
+        },
+        "speed": {
+          "description": "Speed reached by the waypoint (default: unchanged).",
+          "$ref": "#/$defs/Speed"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lat",
+        "lon",
+        "alt"
+      ]
+    },
+    "WindSpec": {
+      "description": "A constant wind.",
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Direction the wind blows from, from true north.",
+          "$ref": "#/$defs/Angle"
+        },
+        "speed": {
+          "description": "Wind speed.",
+          "$ref": "#/$defs/Speed"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "speed",
+        "from"
       ]
     },
     "World": {

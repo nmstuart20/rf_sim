@@ -32,6 +32,6 @@ fn minimal_example_is_clean() {
         s.resources[0].capacity.unwrap().bits_per_second(),
         3_200_000_000
     );
-    let site = &s.platforms[1].position;
+    let site = s.platforms[1].position.as_ref().unwrap();
     assert_eq!(site.mgrs().unwrap().zone(), 18);
 }

@@ -9,6 +9,8 @@
 //! [`AltitudeModel`] holds the geoid and the local atmosphere and runs the chain in
 //! both directions; the inverse resolves scenario positions given as flight levels.
 
+use iqsim_units::{Altitude, AltitudeRef};
+
 use crate::GeoError;
 use crate::atmosphere::{Atmosphere, FT_M};
 use crate::geodetic::Geodetic;
@@ -59,6 +61,26 @@ impl AltitudeModel {
     pub fn mode_c_code(&self, p: Geodetic) -> Result<GillhamCode, GeoError> {
         GillhamCode::encode_pressure_altitude_ft(self.pressure_altitude_ft(p)?)
             .map_err(GeoError::Gillham)
+    }
+
+    /// Ellipsoid height at (φ, λ) radians of a scenario altitude: MSL adds the geoid
+    /// height, a flight level resolves through the inverse pressure chain, and
+    /// ellipsoid heights pass through. AGL is taken as height above the ellipsoid until
+    /// terrain exists (contracts §11.4); ground-clamped motion uses
+    /// [`crate::trajectory::Heights`] instead.
+    pub fn ellipsoid_height_m(
+        &self,
+        lat_rad: f64,
+        lon_rad: f64,
+        alt: Altitude,
+    ) -> Result<f64, GeoError> {
+        match alt.reference() {
+            AltitudeRef::Ellipsoid | AltitudeRef::Agl => Ok(alt.meters()),
+            AltitudeRef::Msl => self.ellipsoid_height_from_msl_m(lat_rad, lon_rad, alt.meters()),
+            AltitudeRef::PressureStd => {
+                self.ellipsoid_height_from_pressure_altitude_m(lat_rad, lon_rad, alt.meters())
+            }
+        }
     }
 
     /// Ellipsoid height at (φ, λ) radians of the point whose pressure altitude is

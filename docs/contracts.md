@@ -503,6 +503,7 @@ iqsim-cli = runtime + control + hil + scenario + contracts (wiring only)
 - **iqsim-worklist:** the `#[repr(C)]` work-list and edge-table arena types (§5.2). **iqsim-waveform:** the edge-table builder (§5.3). **iqsim-render:** the `Backend` trait and the CPU kernel.
 - **Continuous sources (prompt 6a):** the source trait, timelines and the stage-1 kernel in **iqsim-waveform** (`continuous`); window types in **iqsim-worklist**; the Farrow kernel in **iqsim-render**; the SigMF IQ reader in **iqsim-io** (`iq_input`); coordinates, grouping and the reader adapter in **iqsim-runtime**. No dependency edges were added: the runtime adapts the io reader to the waveform trait.
 - **iqsim-geo (prompt 7):** vectors, geodetic ↔ ECEF, pseudo-inertial ECI, quaternions, NED/body/antenna frames, the PGM geoid reader, ISA, Gillham and the altitude chain (§12). It reads a geoid file but hashes nothing; the runtime hashes and registers it. No dependency edges were added (proptest is a dev-dependency).
+- **Trajectories (prompt 8):** the `Trajectory` trait, maneuvers, routes, tracks (the smoothing spline), derived attitude and appends in **iqsim-geo** (`trajectory`, §13); the scenario → trajectory builder in **iqsim-runtime** (`trajectory`). No dependency edges were added.
 - **iqsim-receiver:** the virtual-receiver chain and the antenna-port conversion (§5.4, §5.5). **iqsim-io:** SigMF and UTC labels (sha2, serde_json). **iqsim-runtime:** scenario resolution, the offline pipeline, truth record, manifest and replay (sha2, serde, serde_json, hex, libm; a `build.rs` that only runs `rustc -vV`).
 - **iqsim-contracts:** pure data and pure encode/decode, with no sockets, files or simulation logic (serde, serde_json, sha2, hex since prompt 6). It holds:
   - the control envelope, commands, acks and status
@@ -571,7 +572,10 @@ Scenario files are TOML, read by `iqsim-scenario` into types from `iqsim-units`.
 | `Power` | W, mW, dBm, dBW | f64 W, ≥ 0 | dB via `libm::exp10` |
 | `Gain` | dB, dBi | f64 dB | both stored as dB |
 | `Distance` | m, km, ft, nmi | f64 m | ft = 0.3048 m, nmi = 1852 m |
-| `Speed` | m/s, km/h, kt | f64 m/s | kt = 1852/3600 m/s |
+| `Speed` | m/s, km/h, kt, ft/min | f64 m/s | kt = 1852/3600 m/s; ft/min = 0.3048/60 m/s |
+| `AngularRate` | deg/s, °/s, rad/s | f64 deg/s | |
+| `Acceleration` | m/s², m/s^2, g | f64 m/s² | g = 9.806 65 m/s² |
+| `Jerk` | m/s³, m/s^3 | f64 m/s³ | |
 | `Angle` | deg, °, rad, DMS | f64 deg | |
 | `Pressure` | Pa, hPa, mbar, inHg | f64 Pa, signed | inHg = 3386.389 Pa (conventional); mbar = hPa |
 | `Altitude` | m, km, ft, nmi + reference, or `FLnnn` | f64 m + `AltitudeRef` | reference required |
@@ -599,9 +603,28 @@ Scenario files are TOML, read by `iqsim-scenario` into types from `iqsim-units`.
 - **Render and receiver fields (prompt 6).** `[render] duration, block` (default 1 ms; a whole number of samples at every rate, at most `MAX_BLOCK_LEN`). Per channel and antenna port: `response = { stopband, attenuation, group_delay }` (passband edge = bandwidth/2, stopband edge = stopband/2, floored to µHz; defaults rate, 80 dB, 0). Per channel: `front_end = { gain, noise_figure }`, `thermal_noise` (default true), `clock = { model = "fixed_offset", offset }` (an ideal map with a later epoch), `lo = { model = "fixed_offset", offset }`, `iq = { gain_imbalance, phase_skew, dc_i, dc_q }` (DC as a fraction of full scale), `decimation = { factor, bandwidth, stopband, attenuation }` (defaults 0.8 and 1.0 × output rate, 80 dB), `agc = { target, attack, step, min_gain, max_gain }` (defaults −12 dB FS, 0.01, 0.01, ±40 dB) and `adc = { full_scale, bits, enabled }` (defaults 0 dBm, 16, true). Per antenna port: `full_scale` (default 0 dBm). Per sink: `format = "ci16_le" | "cf32_le"`.
 - **IQ-file emitters (prompt 6a).** `waveform = "iq_file"` with `iq_file = { path, start, end, normalization, sample_rate, response }`. `path` names the `.sigmf-meta` or `.sigmf-data` file, or their common stem, relative to the scenario file. `start` is the emission time of sample 0 (default 0, not negative). `end` is `stop` (strict: the recording must cover the run), `zero_pad` or `loop`, and it is required. `normalization` is `full_scale` (`power` is the power of a |x| = 1 sample) or `rms` (`power` is the recording's mean power), and it is also required. `sample_rate` is optional and must equal the recording's. `response = { bandwidth, stopband, attenuation }` is φ (defaults 0.8 × rate, 1 × rate, 80 dB). The emitter `frequency` is the RF frequency of the recording's 0 Hz. Lint requires an `iq_file` table exactly when `waveform = "iq_file"`, a non-empty path, a non-negative start, and a valid response (checked against `sample_rate` when given). The recording itself is checked at resolution.
 - **Earth model (prompt 7).** `[world] geoid = { path }` (a GeographicLib PGM grid, relative to the scenario file) and `pressure_offset` (a `Pressure`, QNH − 1013.25 hPa, default 0). Lint requires a non-empty path and |offset| ≤ 200 hPa; the grid itself is read at resolution (§12.5, §12.6).
-- **What `sim run` supports (prompt 6, updated in prompt 7).** Static platforms; MSL heights add the geoid height (0 without a grid), flight levels resolve through the inverse pressure-altitude chain, and AGL heights are still taken as ellipsoidal (no terrain yet); mounts and antennas are ignored (isotropic at the platform origin); emitters must use `behavior = "always_on"` and the built-in `waveform = "cw"` or `"iq_file"` (prompt 6a); only SigMF sinks are written, and a stream's sinks must agree on the format. Anything else is a resolution error, never a silent default.
+- **Trajectories (prompt 8).** `[platforms.trajectory] kind = "static" | "maneuvers" | "route" | "track" | "ground"` (default static; §13). Fields:
+  - `start` (initial truth time, default 0 s), `heading` (initial track) and `speed`, for maneuvers, route and ground;
+  - `attitude = { heading, pitch, roll }`, static only;
+  - `angle_of_attack` and `wind = { speed, from }`, for the airborne kinds (maneuvers, route, track);
+  - `limits = { bank, roll_rate, accel, jerk, vertical_accel, vertical_jerk, climb_rate }`, for moving kinds;
+  - `[[…maneuvers]] { kind = straight | turn | climb | speed, duration, rate, bank, direction, heading, by, vertical_rate, angle, altitude, speed }`;
+  - `[[…waypoints]] { lat, lon, alt, speed }`;
+  - `points = [{ time, lat, lon, alt }]` and `smoothing` (τ), for tracks.
+
+  Lint rejects:
+  - a field its kind does not use;
+  - a missing required field: heading and speed for maneuvers; speed for route and ground; at least one maneuver or waypoint; a ground trajectory needs exactly one of maneuvers and waypoints;
+  - a `position` on a track (it starts at its first point), or a missing `position` on any other kind (`position` is optional in the schema since prompt 8);
+  - a maneuver without exactly one rate (rate/bank or vertical_rate/angle) and one end (duration/heading/by or altitude/duration), or a turn by duration or angle without `direction`;
+  - a non-positive limit, a bank outside (0°, 80°), or a speed below 1 m/s;
+  - for ground trajectories, a non-AGL altitude or a climb;
+  - fewer than two track points, or times that do not strictly increase.
+
+  Geometric feasibility (a waypoint inside the turn circle, an unreachable altitude) is checked when the trajectory is built at resolution.
+- **What `sim run` supports (prompt 6, updated in prompts 7 and 8).** Static platforms; every trajectory is built at resolution, and a moving one is then an explicit error until the light-time geometry engine (prompt 9); MSL heights add the geoid height (0 without a grid), flight levels resolve through the inverse pressure-altitude chain, and AGL heights are still taken as ellipsoidal (no terrain yet); mounts and antennas are ignored (isotropic at the platform origin); emitters must use `behavior = "always_on"` and the built-in `waveform = "cw"` or `"iq_file"` (prompt 6a); only SigMF sinks are written, and a stream's sinks must agree on the format. Anything else is a resolution error, never a silent default.
 - **Diagnostics:** `file:line:col: error: message` with 1-based lines and columns counted in characters, then the source line with a caret under the span. Duplicates add a `note:` at the first definition. `sim lint` exits 0 when clean, 1 on errors or an unreadable file, and 2 on usage errors.
-- Clock and LO models (`{ model = "ideal" }`), trajectories (`{ kind = "static" }`), mounts, sinks and resources are placeholders that later prompts extend. Resource capacity is optional, and a missing capacity is reported as unverified (§8).
+- Clock and LO models (`{ model = "ideal" }`), mounts, sinks and resources are placeholders that later prompts extend. Resource capacity is optional, and a missing capacity is reported as unverified (§8).
 
 ## 12. Frames, geodesy and altitude (settled, prompt 7)
 
@@ -648,3 +671,138 @@ All in `iqsim-geo`, f64, every transcendental through `libm`, every product and 
 - **Local pressure offset** Δp = QNH − 1013.25 hPa (`[world] pressure_offset`, |Δp| ≤ 200 hPa, default 0): the local atmosphere is the ISA temperature profile with sea-level pressure p₀ + Δp, which scales pressure at every height by (p₀ + Δp)/p₀.
 - **Chain** (`AltitudeModel`): ellipsoid h → MSL (h − N) → geopotential → local pressure → ISA pressure altitude → Gillham. The inverse resolves `FLnnn` scenario positions (pressure altitude nnn × 100 ft) to ellipsoid heights.
 - **Gillham:** 500 ft index n = ⌊(alt + 1200)/500⌋ as a reflected Gray code on D2 D4 A1 A2 A4 B1 B2 B4; C1 C2 C4 = 001, 011, 010, 110, 100 for the 100 ft step m = 0…4 within the band, reversed when n is odd; D1 always 0; C patterns 000, 101, 111 illegal. Range −1200 ft to 126 700 ft, the full published table (ICAO's nominal range starts at −1000 ft; the two lower codes exist and are accepted). Encoding rounds to the nearest 100 ft with transitions at ±50 ft and ties toward +∞. All 1280 rows of the AirSport Avionics published table match.
+
+## 13. Trajectories and attitude (settled, prompt 8)
+
+All in `iqsim-geo::trajectory`, f64 through `libm`, separate multiplies and adds in a fixed order, as in §12. A trajectory is control-plane truth: prompt 9 fits render polynomials to it.
+
+### 13.1 Trait and state
+
+- `Trajectory::state(t: AcqInstant) -> State` is pure and deterministic, for any instant in `span()` (fractional picoseconds allowed); outside it is `GeoError::OutsideSpan`. `knots(from, to)` lists every instant where jerk (and so angular rate) may be discontinuous; prompt 9 splits fits there.
+- `State`: ECEF position (m), Earth-relative velocity and acceleration in ECEF axes (m/s, m/s²), `q_ecef_body` (§12.4 convention; `q_ned_body()` and `pose()` derive the NED form), and the angular velocity of the body **relative to ECEF**, in **body axes** (rad/s). Add Earth rotation for inertial rates.
+- Inside a piece, local time is the exact Q64.64 difference `t − start`, rounded once to f64 ps and divided by 10¹², so no absolute time meets a floating-point product.
+
+### 13.2 Representation
+
+- Every moving trajectory (`Flight`) is a `Path` of `Piece`s with **knots at whole picoseconds**. A piece is a quintic per ECEF axis in local seconds (tracks use its cubic subset). Velocity, acceleration and jerk are its derivatives, so they are always consistent with position.
+- Maneuver pieces are quintic Hermite interpolants of (p, v, a) at both ends, and consecutive pieces share their knot values, so motion is **C2** (to f64 rounding: over the 356 knots of the test flight the largest jumps are 0 m, 2·10⁻¹² m/s and 6·10⁻¹² m/s²). Jerk is discontinuous at knots.
+- Nodes are placed at:
+  - segment ends;
+  - every channel breakpoint, rounded to the nearest ps;
+  - extra nodes so spacing is at most **1 s**, and at most **0.1 rad of turn** (spacing ≤ 0.1/|ω|max, for fast turns at low speed).
+- Nodes closer than **1 ms** merge, which leaves that breakpoint just inside a piece.
+- **Segments** last at least 1 ms: shorter transitions are held to 1 ms, and an explicit duration under 1 ms is an error. A segment with nothing to do (a change to the current speed or heading) adds no piece.
+- **Short pieces** (< 0.1 s) take their displacement from the end velocities and accelerations, `Δp = T(v₀ + v₁)/2 + T²(a₀ − a₁)/12` (exact for quartic motion), instead of `p₁ − p₀`. Otherwise the ~10⁻⁹ m rounding of Earth-sized positions would be divided by T² and T³. They end within that rounding (plus < 10⁻¹¹ m truncation) of the next knot's position, with velocity and acceleration matched exactly. Pieces of 0.1 s or more use `p₁ − p₀`, which keeps acceleration rounding noise below 6·10⁻⁶ m/s².
+- Piece lengths are computed in i128, and a non-positive length is an error.
+- The Hermite error against the ODE solution is O(h⁶) (≈ 2·10⁻⁹ m for a 3°/s turn at 1 s spacing). It is not a model error: the pieces *are* the truth.
+
+### 13.3 Horizontal motion (n-vector ODE)
+
+- State `(n, d)`:
+  - `n` is the geodetic up normal; with height h, `point(n, h) = (N n_x, N n_y, N(1 − e²) n_z) + h n`.
+  - `d` is the horizontal unit track direction.
+- Neither has a pole singularity.
+- ODE:
+  - `ṅ = K(n, h)·V_h d`, with `K x = x/(N + h) + c (w·x) w`, `w = ẑ − n_z n` and `c = a e²/(W³(M + h)(N + h))`. This equals the meridian and prime-vertical rates and is smooth at the poles.
+  - `ḋ = −ω (n × d) − (d·ṅ) n`.
+  - ω > 0 turns right (clockwise seen from above).
+  - ω = 0 is parallel transport: **"straight" means zero lateral acceleration**, a geodesic of the height surface, not a rhumb line. The right-hand lateral acceleration is exactly `V_h ω + ḣ (ṅ·right)`; the second term is ~10⁻⁹ of the first.
+- Integration: classic RK4 with steps ≤ min(0.125 s, 0.02 rad/|ω|max), renormalizing n and re-orthogonalizing d after every step.
+- `V_h = √(V² − ḣ²)` (V is the total speed). It must stay ≥ **1 m/s**.
+
+### 13.4 Channels and primitives
+
+- **Channels.** Turn rate ω is continuous and piecewise linear, ramping at `g₀·roll_rate/V` (V at the segment start). Speed V and vertical rate ḣ are S-curves: their derivative is continuous, piecewise linear, bounded by the acceleration limit, and changes at the jerk limit. h is the exact integral of ḣ (piecewise cubic).
+- **S-curve** from (x₀, ẋ₀) to x₁ with ẋ = 0 at the end:
+  - The direction comes from the stopping point `x₀ + ẋ₀|ẋ₀|/(2J)`.
+  - The peak is `p² = J·D + b₀²/2`, clamped to A with a hold of `(D − (2A² − b₀²)/(2J))/A`.
+  - An initial |ẋ₀| above A raises the limit to |ẋ₀|.
+- **Move by Δ** (turn by angle, climb to altitude): rise to a peak, hold, fall to 0, with total integral Δ. Either the peak is ±peak_max with a closed-form hold, or it is a root of `integral(peak) = Δ`.
+  - The integral is not monotone in the peak when the start has non-zero rate and acceleration. So the range is scanned in 64 steps from ±peak_max towards ∓peak_max, and the first sign change is refined by 200 bisection steps (the root with the largest peak towards Δ).
+  - No root is an error: the start state overshoots Δ whatever the peak.
+- **Primitives:**
+  - `straight {duration}`
+  - `turn {rate | bank; duration (total) | heading | by; direction}`
+  - `climb {vertical_rate | angle; altitude | duration}`
+  - `speed {speed}`
+
+  Each primitive is one segment that commands all three channels. Channels it does not name return to rest: ω → 0, ḣ → 0, and V̇ → 0 at the speed reached. A segment lasts until its channels finish, or its duration if that is later. Turns and climbs by duration fail if the duration is shorter than their transitions.
+  - A bank-specified turn uses `ω = g₀ tan φ / V` at the start speed. Banks of 80° or more are rejected.
+  - A climb by angle uses `ḣ = V sin γ` at the start speed.
+  - Altitude targets convert to ellipsoid heights through the `AltitudeModel` (and the `Ground` for AGL) **at the point where the climb starts**. The platform then holds constant ellipsoid height, so a flight level is not followed across geoid or pressure changes.
+  - **Turn to heading** shoots on the turn angle, `Δ ← Δ + wrap(target − final track)`, to 10⁻¹² rad, because the track also drifts over the curved Earth (`χ̇ = ω + λ̇ sin φ`). The default direction is the shortest way. **Turn by** is relative to a straight path, so the final track differs from start + Δ by that drift.
+- **Defaults** (`Limits`; `[platforms.trajectory.limits]`):
+
+  | Limit | Default |
+  | --- | --- |
+  | route bank | 25° |
+  | roll rate | 10°/s |
+  | accel | 1 m/s² |
+  | jerk | 0.5 m/s³ |
+  | vertical accel | 0.5 m/s² |
+  | vertical jerk | 0.25 m/s³ |
+  | route climb rate | 1500 ft/min = 7.62 m/s |
+
+### 13.5 Derived attitude
+
+- One function of (p, v, a, j) for every moving source, so attitude always agrees with the kinematics:
+  - n comes from the geodetic inverse, with `ḣ = v·n`, `v_h = v − ḣn`, `ṅ = K v_h`, `ḧ = a·n + v·ṅ`;
+  - with a constant wind w (NED, rotated with the local frame), the air-relative horizontal velocity is `u = v_h − w`;
+  - the heading frame H is x along u, y right, z down;
+  - **pitch** `θ = atan2(ḣ, |u|) + α`;
+  - **bank** `φ = atan2(a·y_H, g₀)` with g₀ = 9.806 65 m/s², i.e. `tan φ = V ω / g₀` in a coordinated turn;
+  - `q_ecef_body = q_ecef_H ⊗ q_y(θ) ⊗ q_x(φ)`, which is heading (track plus crab), pitch, roll in the aerospace 3-2-1 sequence;
+  - the angular rate is `Ω_H + θ̇ y_H + φ̇ x_body`, with `Ω_H = ½ Σ hᵢ × ḣᵢ`, all in closed form (φ̇ uses the jerk).
+- Approximations:
+  - α is applied as a pitch offset before bank;
+  - bank uses the Earth-fixed lateral acceleration, so Coriolis (≈ 0.04 m/s² at 250 m/s) and the curvature's vertical acceleration (V²/R ≈ 0.01 m/s²) are excluded, as the design's formula says.
+- Errors:
+  - the heading is undefined below 0.1 m/s air-relative horizontal speed (an error at evaluation);
+  - wind is rejected within 0.01° of a pole.
+- Modes:
+  - `Derived {angle_of_attack, wind}`: the airborne kinds.
+  - `Ground`: no bank and no α; pitch follows the along-track slope.
+  - `Fixed(q_ned_body)`: static platforms only.
+- Measured:
+  - bank within 0.01° of `atan(Vω/g₀)` at five latitudes up to 89.5° and three speeds;
+  - the angular rate matches quaternion differences to 2·10⁻⁶ rad/s.
+
+### 13.6 Routes
+
+- Waypoints `{lat, lon, alt, speed?}` are flown over. Each leg is one segment from the previous waypoint (or the start):
+  - turn by Δ at the route bank;
+  - climb or descend at the route climb rate to the waypoint altitude (converted at the waypoint), starting at the leg start and level by the waypoint;
+  - change to the waypoint speed (kept if not given);
+  - straight for the rest.
+- Shooting on (Δ, leg duration T):
+  - From the end state, the along-track miss `e_a` and the cross-track miss `e_c` update `T += e_a/V_h` and `Δ += e_c/L`, with L the distance flown after the turn.
+  - The misses are the chord projected on the local horizontal when the normals are within 10⁻³ rad. Beyond that they are the surface arc `angle(n, n_w)·(N + h)` along the initial direction to the waypoint, so a far waypoint is never mistaken for an arrival. An antipodal waypoint (no defined direction) is an error.
+  - It stops at **10⁻⁴ m** in both, and at 10⁻³ m in 3-D distance. It fails after 40 iterations, or when the waypoint is too close for the transitions.
+- The initial heading defaults to the bearing of the first waypoint.
+- Tested passing within 1 cm horizontally and 1 cm vertically, with the speed reached, in three cases: a four-waypoint route in England, a dateline crossing, and a route over the North Pole.
+
+### 13.7 Track replay
+
+- **Reinsch** natural cubic smoothing spline per ECEF axis (relative to the first point):
+  - It minimizes `Σ |y_i − f(t_i)|² + λ ∫ |f″|² dt`.
+  - The solve is a banded LDLᵀ in a fixed order.
+  - Knots are at the timestamps.
+  - The span is [t₀, tₙ].
+- **Smoothing parameter.** `smoothing = τ` (default 0 s, which interpolates exactly), with `λ = τ⁴/Δt̄`, where Δt̄ is the mean spacing. For uniform sampling the spline acts on motion at angular frequency ω as the zero-phase gain `1/(1 + (ωτ)⁴)`. Measured: 0.500 000 03 at ωτ = 1 and 0.941 176 48 at ωτ = 0.5.
+- Points convert with the `AltitudeModel` at each point.
+- Replay timing:
+  - at τ = 0, positions at the timestamps match within 1 µm;
+  - at τ = 2 s, the closest approach to each point is at its timestamp within 10 ms (mean offset < 0.2 ms), with local shifts only where the recorded motion's jerk steps.
+
+### 13.8 Static, ground and appends
+
+- **`Static`:** fixed position and attitude relative to NED (`{heading, pitch, roll}`, default 0), zero velocity, acceleration and rate, unbounded span.
+- **Ground-clamped (placeholder):** maneuvers without climbs, or routes whose heights are AGL over a `Ground` surface. Until terrain (prompt 22) the surface is `FlatGround`, which the runtime sets to the ellipsoid, consistent with AGL positions (§11.4). A terrain model must be C2 along the path for the clamp to stay C2.
+- **Append** (`Flight::append(t, primitives)`, `append_route(t, waypoints)`, used by runtime maneuvers in prompt 16):
+  - It replaces everything planned after t.
+  - The piece containing t keeps its coefficients and only ends at t, so **every instant before t evaluates to the same bits**.
+  - The new channel and ODE state is the exact inverse of the node formulas applied to the (p, v, a) at t (`ω = (a·right − ḣ ṅ·right)/V_h`, …).
+  - The first new piece starts from that exact (p, v, a), so the join is C2. The geodetic round trip (~10⁻⁷ m) is absorbed inside that first piece.
+  - Appends work after track prefixes too.
+  - On error the flight is unchanged.
+- **`extend_to(t)`** appends straight and level until at least t.
